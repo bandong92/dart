@@ -31,7 +31,7 @@ from training import ExportOnnxTask, TORCH_IMPORT_ERROR, TrainingTask, torch
 
 
 PREVIEW_SAMPLE_LIMIT = 48
-VALIDATION_PREVIEW_LIMIT = 24
+VALIDATION_BROWSER_BATCH_SIZE = 256
 SUPPORTED_DATASETS = ("train", "validation", "test")
 
 
@@ -205,6 +205,41 @@ class DatasetScanTask(QRunnable):
             self.signals.failed.emit(self.dataset_name, str(exc))
 
 
+class ValidationBrowserSignals(QObject):
+    batch = pyqtSignal(object)
+    finished = pyqtSignal(int)
+    failed = pyqtSignal(str)
+
+
+class ValidationBrowserTask(QRunnable):
+    def __init__(self, folder_path):
+        super().__init__()
+        self.folder_path = folder_path
+        self.signals = ValidationBrowserSignals()
+
+    def run(self):
+        try:
+            pairs, _ = collect_paired_samples(self.folder_path)
+            batch = []
+            for index, (cad_path, ori_path, _label) in enumerate(pairs, start=1):
+                batch.append(
+                    {
+                        "index": index,
+                        "cad_path": cad_path,
+                        "ori_path": ori_path,
+                    }
+                )
+                if len(batch) >= VALIDATION_BROWSER_BATCH_SIZE:
+                    self.signals.batch.emit(batch)
+                    batch = []
+
+            if batch:
+                self.signals.batch.emit(batch)
+            self.signals.finished.emit(len(pairs))
+        except Exception as exc:
+            self.signals.failed.emit(str(exc))
+
+
 class DatasetPanel(QGroupBox):
     path_requested = pyqtSignal(str)
 
@@ -282,13 +317,13 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.thread_pool = QThreadPool.globalInstance()
         self.dataset_panels = {}
-        self.validation_preview_records = deque(maxlen=VALIDATION_PREVIEW_LIMIT)
-        self.validation_preview_cache = {}
+        self.validation_browser_pixmap_cache = {}
         self.is_training = False
         self.is_exporting = False
         self.onnx_export_ready = False
         self.latest_checkpoint_path = None
         self.best_checkpoint_path = None
+        self.validation_browser_item_count = 0
         self._build_ui()
 
     def _build_ui(self):
@@ -403,20 +438,20 @@ class MainWindow(QMainWindow):
         validation_layout.setContentsMargins(18, 18, 18, 18)
         validation_layout.setSpacing(12)
 
-        validation_title = QLabel("Validation Monitor")
+        validation_title = QLabel("Validation Browser")
         validation_title.setStyleSheet("font-size: 15pt; font-weight: 700; color: #f4efe7;")
         validation_layout.addWidget(validation_title)
 
         validation_hint = QLabel(
-            "Validation preview images will appear here during training. "
-            "For smooth performance, only a small recent window is kept in memory."
+            "All validation CAD and ORI pairs are listed in scan order. "
+            "Only the selected pair is loaded as an image so large datasets stay responsive."
         )
         validation_hint.setWordWrap(True)
         validation_hint.setStyleSheet("color: #a79d90;")
         validation_layout.addWidget(validation_hint)
 
         self.validation_status_label = QLabel(
-            "No validation preview yet. Start training with a validation dataset to populate this monitor."
+            "Select a validation dataset folder to populate this browser."
         )
         self.validation_status_label.setWordWrap(True)
         self.validation_status_label.setStyleSheet(
@@ -424,26 +459,27 @@ class MainWindow(QMainWindow):
         )
         validation_layout.addWidget(self.validation_status_label)
 
-        self.validation_list = QListWidget()
-        self.validation_list.setMinimumHeight(150)
-        self.validation_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.validation_list.currentItemChanged.connect(self.on_validation_preview_selected)
-        validation_layout.addWidget(self.validation_list, stretch=1)
+        self.validation_browser_list = QListWidget()
+        self.validation_browser_list.setMinimumHeight(220)
+        self.validation_browser_list.setUniformItemSizes(True)
+        self.validation_browser_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.validation_browser_list.currentItemChanged.connect(self.on_validation_browser_selected)
+        validation_layout.addWidget(self.validation_browser_list, stretch=1)
 
         image_row = QHBoxLayout()
         image_row.setSpacing(12)
-        self.validation_cad_label = self._create_preview_panel("Validation CAD")
-        self.validation_ori_label = self._create_preview_panel("Validation ORI")
-        image_row.addWidget(self.validation_cad_label, stretch=1)
-        image_row.addWidget(self.validation_ori_label, stretch=1)
+        self.validation_browser_cad_label = self._create_preview_panel("Validation CAD")
+        self.validation_browser_ori_label = self._create_preview_panel("Validation ORI")
+        image_row.addWidget(self.validation_browser_cad_label, stretch=1)
+        image_row.addWidget(self.validation_browser_ori_label, stretch=1)
         validation_layout.addLayout(image_row, stretch=1)
 
-        self.validation_meta_label = QLabel("Validation preview metadata will appear here.")
-        self.validation_meta_label.setWordWrap(True)
-        self.validation_meta_label.setStyleSheet(
+        self.validation_browser_meta_label = QLabel("Validation pair metadata will appear here.")
+        self.validation_browser_meta_label.setWordWrap(True)
+        self.validation_browser_meta_label.setStyleSheet(
             "color: #a99d91; background: #121518; border: 1px solid #262b31; border-radius: 12px; padding: 10px 12px;"
         )
-        validation_layout.addWidget(self.validation_meta_label)
+        validation_layout.addWidget(self.validation_browser_meta_label)
 
         right_layout.addWidget(validation_card, stretch=1)
 
@@ -476,7 +512,20 @@ class MainWindow(QMainWindow):
         task.signals.finished.connect(self.on_scan_finished)
         task.signals.failed.connect(self.on_scan_failed)
         self.thread_pool.start(task)
+
+        if dataset_name == "validation":
+            self.start_validation_browser_scan(folder_path)
+
         self.refresh_action_state()
+
+    def start_validation_browser_scan(self, folder_path):
+        self.clear_validation_browser()
+        self.validation_status_label.setText("Scanning validation pairs in background...")
+        task = ValidationBrowserTask(folder_path)
+        task.signals.batch.connect(self.on_validation_browser_batch)
+        task.signals.finished.connect(self.on_validation_browser_finished)
+        task.signals.failed.connect(self.on_validation_browser_failed)
+        self.thread_pool.start(task)
 
     def on_scan_progress(self, dataset_name, count, sample_count):
         self.dataset_panels[dataset_name].set_status(
@@ -531,7 +580,6 @@ class MainWindow(QMainWindow):
         self.latest_checkpoint_path = None
         self.best_checkpoint_path = None
         self.log_view.clear()
-        self.clear_validation_preview()
         self.append_log("Starting training...")
         self.summary_label.setText("Training in progress. Checkpoints will be saved automatically to outputs.")
         self.refresh_action_state()
@@ -610,62 +658,62 @@ class MainWindow(QMainWindow):
         self.log_view.append(message)
 
     def on_validation_preview(self, payload):
-        record = dict(payload)
-        record_id = record.get("id") or f"preview-{len(self.validation_preview_records) + 1}"
-        record["id"] = record_id
+        record = {
+            "index": payload.get("index", self.validation_browser_item_count + 1),
+            "cad_path": payload.get("cad_path", ""),
+            "ori_path": payload.get("ori_path", ""),
+            "title": payload.get("title"),
+            "tooltip": payload.get("tooltip"),
+            "meta": payload.get("meta"),
+            "auto_select": payload.get("auto_select", True),
+        }
+        self._append_validation_browser_entry(record)
 
-        if len(self.validation_preview_records) == self.validation_preview_records.maxlen:
-            oldest = self.validation_preview_records.popleft()
-            self.validation_preview_cache.pop(oldest["id"], None)
-            if self.validation_list.count() > 0:
-                self.validation_list.takeItem(0)
+    def on_validation_browser_batch(self, batch):
+        for entry in batch:
+            self._append_validation_browser_entry(entry, auto_select=False)
 
-        self.validation_preview_records.append(record)
-        item = QListWidgetItem(record.get("title", f"Epoch {record.get('epoch', '-')}, batch {record.get('batch', '-')}"))
-        item.setData(Qt.UserRole, record_id)
-        item.setToolTip(record.get("tooltip", "Validation preview"))
-        self.validation_list.addItem(item)
         self.validation_status_label.setText(
-            f"Validation preview ready. Showing the latest {len(self.validation_preview_records)} captured items only."
+            f"Loading validation pairs... {self.validation_browser_list.count():,} items ready."
+        )
+        if self.validation_browser_list.count() == len(batch):
+            self.validation_browser_list.setCurrentRow(0)
+
+    def on_validation_browser_finished(self, total_count):
+        self.validation_status_label.setText(
+            f"Validation browser ready. {total_count:,} pairs available in scroll view."
         )
 
-        if self.validation_list.count() == 1 or record.get("auto_select", True):
-            self.validation_list.setCurrentRow(self.validation_list.count() - 1)
+    def on_validation_browser_failed(self, error_message):
+        self.validation_status_label.setText("Validation browser scan failed.")
+        QMessageBox.critical(self, "Validation browser scan failed", error_message)
 
-    def on_validation_preview_selected(self, current_item, _previous_item):
+    def on_validation_browser_selected(self, current_item, _previous_item):
         if not current_item:
             return
 
-        record_id = current_item.data(Qt.UserRole)
-        record = next((item for item in self.validation_preview_records if item["id"] == record_id), None)
-        if record is None:
-            return
-
-        self.validation_meta_label.setText(record.get("meta", "Validation preview metadata will appear here."))
-
-        cached = self.validation_preview_cache.get(record_id)
-        if cached is None:
-            cad_pixmap = self._load_preview_pixmap(record.get("cad_path"))
-            ori_pixmap = self._load_preview_pixmap(record.get("ori_path"))
-            self.validation_preview_cache[record_id] = (cad_pixmap, ori_pixmap)
-        else:
-            cad_pixmap, ori_pixmap = cached
-
-        self._set_preview_pixmap(self.validation_cad_label, cad_pixmap, "Validation CAD")
-        self._set_preview_pixmap(self.validation_ori_label, ori_pixmap, "Validation ORI")
-
-    def clear_validation_preview(self):
-        self.validation_preview_records.clear()
-        self.validation_preview_cache.clear()
-        self.validation_list.clear()
-        self.validation_status_label.setText(
-            "No validation preview yet. Start training with a validation dataset to populate this monitor."
+        entry = current_item.data(Qt.UserRole)
+        cad_path = entry["cad_path"]
+        ori_path = entry["ori_path"]
+        self.validation_browser_meta_label.setText(
+            f"Index: {entry['index']}\nCAD: {cad_path}\nORI: {ori_path}"
         )
-        self.validation_meta_label.setText("Validation preview metadata will appear here.")
-        self.validation_cad_label.setText("Validation CAD")
-        self.validation_cad_label.setPixmap(QPixmap())
-        self.validation_ori_label.setText("Validation ORI")
-        self.validation_ori_label.setPixmap(QPixmap())
+
+        cad_pixmap = self._get_validation_browser_pixmap(cad_path)
+        ori_pixmap = self._get_validation_browser_pixmap(ori_path)
+        self._set_preview_pixmap(self.validation_browser_cad_label, cad_pixmap, "Validation CAD")
+        self._set_preview_pixmap(self.validation_browser_ori_label, ori_pixmap, "Validation ORI")
+
+    def clear_validation_browser(self):
+        self.validation_browser_item_count = 0
+        self.validation_browser_list.clear()
+        self.validation_browser_pixmap_cache.clear()
+        self.validation_status_label.setText("Select a validation dataset folder to populate this browser.")
+        self.validation_browser_meta_label.setText("Validation pair metadata will appear here.")
+        self.validation_browser_cad_label.setText("Validation CAD")
+        self.validation_browser_cad_label.setPixmap(QPixmap())
+        self.validation_browser_ori_label.setText("Validation ORI")
+        self.validation_browser_ori_label.setPixmap(QPixmap())
 
     def refresh_action_state(self):
         train_ready = os.path.isdir(self.dataset_panels["train"].path_edit.text().strip())
@@ -704,9 +752,9 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        current_item = self.validation_list.currentItem()
-        if current_item is not None:
-            self.on_validation_preview_selected(current_item, None)
+        current_browser_item = self.validation_browser_list.currentItem()
+        if current_browser_item is not None:
+            self.on_validation_browser_selected(current_browser_item, None)
 
     def _create_preview_panel(self, placeholder_text):
         label = QLabel()
@@ -727,6 +775,35 @@ class MainWindow(QMainWindow):
         if pixmap.isNull():
             return None
         return pixmap
+
+    def _get_validation_browser_pixmap(self, image_path):
+        if image_path in self.validation_browser_pixmap_cache:
+            return self.validation_browser_pixmap_cache[image_path]
+
+        pixmap = self._load_preview_pixmap(image_path)
+        if pixmap is None:
+            return None
+
+        if len(self.validation_browser_pixmap_cache) >= 16:
+            oldest_key = next(iter(self.validation_browser_pixmap_cache))
+            self.validation_browser_pixmap_cache.pop(oldest_key, None)
+
+        self.validation_browser_pixmap_cache[image_path] = pixmap
+        return pixmap
+
+    def _append_validation_browser_entry(self, entry, auto_select=None):
+        self.validation_browser_item_count += 1
+        item_title = entry.get("title") or f"{entry['index']:06d} | {os.path.basename(entry['ori_path'])}"
+        item = QListWidgetItem(item_title)
+        item.setToolTip(
+            entry.get("tooltip") or f"CAD: {entry['cad_path']}\nORI: {entry['ori_path']}"
+        )
+        item.setData(Qt.UserRole, entry)
+        self.validation_browser_list.addItem(item)
+
+        should_select = entry.get("auto_select", True) if auto_select is None else auto_select
+        if self.validation_browser_list.count() == 1 or should_select:
+            self.validation_browser_list.setCurrentRow(self.validation_browser_list.count() - 1)
 
     def _set_preview_pixmap(self, label, pixmap, fallback_text):
         if pixmap is None:
