@@ -2,6 +2,7 @@ import os
 from collections import deque
 
 from PyQt5.QtCore import QObject, QRunnable, Qt, QThreadPool, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
@@ -18,6 +19,7 @@ from PyQt5.QtWidgets import (
     QFrame,
     QSizePolicy,
     QSpinBox,
+    QSplitter,
     QTextEdit,
     QTabWidget,
     QVBoxLayout,
@@ -29,6 +31,7 @@ from training import ExportOnnxTask, TORCH_IMPORT_ERROR, TrainingTask, torch
 
 
 PREVIEW_SAMPLE_LIMIT = 48
+VALIDATION_PREVIEW_LIMIT = 24
 SUPPORTED_DATASETS = ("train", "validation", "test")
 
 
@@ -279,6 +282,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.thread_pool = QThreadPool.globalInstance()
         self.dataset_panels = {}
+        self.validation_preview_records = deque(maxlen=VALIDATION_PREVIEW_LIMIT)
+        self.validation_preview_cache = {}
         self.is_training = False
         self.is_exporting = False
         self.onnx_export_ready = False
@@ -308,6 +313,10 @@ class MainWindow(QMainWindow):
         hero_title.setObjectName("heroTitle")
         hero_layout.addWidget(hero_title)
         outer_layout.addWidget(hero_card)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        outer_layout.addWidget(splitter, stretch=1)
 
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -382,7 +391,69 @@ class MainWindow(QMainWindow):
             "background: #121518; border: 1px solid #262b31; border-radius: 12px; color: #ded6cb; padding: 8px;"
         )
         left_layout.addWidget(self.log_view, stretch=0)
-        outer_layout.addWidget(left_widget, stretch=1)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(12)
+
+        validation_card = QFrame()
+        validation_card.setObjectName("previewCard")
+        validation_layout = QVBoxLayout(validation_card)
+        validation_layout.setContentsMargins(18, 18, 18, 18)
+        validation_layout.setSpacing(12)
+
+        validation_title = QLabel("Validation Monitor")
+        validation_title.setStyleSheet("font-size: 15pt; font-weight: 700; color: #f4efe7;")
+        validation_layout.addWidget(validation_title)
+
+        validation_hint = QLabel(
+            "Validation preview images will appear here during training. "
+            "For smooth performance, only a small recent window is kept in memory."
+        )
+        validation_hint.setWordWrap(True)
+        validation_hint.setStyleSheet("color: #a79d90;")
+        validation_layout.addWidget(validation_hint)
+
+        self.validation_status_label = QLabel(
+            "No validation preview yet. Start training with a validation dataset to populate this monitor."
+        )
+        self.validation_status_label.setWordWrap(True)
+        self.validation_status_label.setStyleSheet(
+            "color: #aea397; background: #121518; border: 1px solid #262b31; border-radius: 10px; padding: 8px 10px;"
+        )
+        validation_layout.addWidget(self.validation_status_label)
+
+        self.validation_list = QListWidget()
+        self.validation_list.setMinimumHeight(150)
+        self.validation_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.validation_list.currentItemChanged.connect(self.on_validation_preview_selected)
+        validation_layout.addWidget(self.validation_list, stretch=1)
+
+        image_row = QHBoxLayout()
+        image_row.setSpacing(12)
+        self.validation_cad_label = self._create_preview_panel("Validation CAD")
+        self.validation_ori_label = self._create_preview_panel("Validation ORI")
+        image_row.addWidget(self.validation_cad_label, stretch=1)
+        image_row.addWidget(self.validation_ori_label, stretch=1)
+        validation_layout.addLayout(image_row, stretch=1)
+
+        self.validation_meta_label = QLabel("Validation preview metadata will appear here.")
+        self.validation_meta_label.setWordWrap(True)
+        self.validation_meta_label.setStyleSheet(
+            "color: #a99d91; background: #121518; border: 1px solid #262b31; border-radius: 12px; padding: 10px 12px;"
+        )
+        validation_layout.addWidget(self.validation_meta_label)
+
+        right_layout.addWidget(validation_card, stretch=1)
+
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        left_widget.setMinimumWidth(460)
+        right_widget.setMinimumWidth(520)
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 6)
+        splitter.setSizes([620, 740])
         self.refresh_action_state()
 
     def select_folder(self, dataset_name):
@@ -460,6 +531,7 @@ class MainWindow(QMainWindow):
         self.latest_checkpoint_path = None
         self.best_checkpoint_path = None
         self.log_view.clear()
+        self.clear_validation_preview()
         self.append_log("Starting training...")
         self.summary_label.setText("Training in progress. Checkpoints will be saved automatically to outputs.")
         self.refresh_action_state()
@@ -467,6 +539,7 @@ class MainWindow(QMainWindow):
         task = TrainingTask(config)
         task.signals.started.connect(self.append_log)
         task.signals.progress.connect(self.append_log)
+        task.signals.validation_preview.connect(self.on_validation_preview)
         task.signals.finished.connect(self.on_training_finished)
         task.signals.failed.connect(self.on_training_failed)
         self.thread_pool.start(task)
@@ -536,6 +609,64 @@ class MainWindow(QMainWindow):
     def append_log(self, message):
         self.log_view.append(message)
 
+    def on_validation_preview(self, payload):
+        record = dict(payload)
+        record_id = record.get("id") or f"preview-{len(self.validation_preview_records) + 1}"
+        record["id"] = record_id
+
+        if len(self.validation_preview_records) == self.validation_preview_records.maxlen:
+            oldest = self.validation_preview_records.popleft()
+            self.validation_preview_cache.pop(oldest["id"], None)
+            if self.validation_list.count() > 0:
+                self.validation_list.takeItem(0)
+
+        self.validation_preview_records.append(record)
+        item = QListWidgetItem(record.get("title", f"Epoch {record.get('epoch', '-')}, batch {record.get('batch', '-')}"))
+        item.setData(Qt.UserRole, record_id)
+        item.setToolTip(record.get("tooltip", "Validation preview"))
+        self.validation_list.addItem(item)
+        self.validation_status_label.setText(
+            f"Validation preview ready. Showing the latest {len(self.validation_preview_records)} captured items only."
+        )
+
+        if self.validation_list.count() == 1 or record.get("auto_select", True):
+            self.validation_list.setCurrentRow(self.validation_list.count() - 1)
+
+    def on_validation_preview_selected(self, current_item, _previous_item):
+        if not current_item:
+            return
+
+        record_id = current_item.data(Qt.UserRole)
+        record = next((item for item in self.validation_preview_records if item["id"] == record_id), None)
+        if record is None:
+            return
+
+        self.validation_meta_label.setText(record.get("meta", "Validation preview metadata will appear here."))
+
+        cached = self.validation_preview_cache.get(record_id)
+        if cached is None:
+            cad_pixmap = self._load_preview_pixmap(record.get("cad_path"))
+            ori_pixmap = self._load_preview_pixmap(record.get("ori_path"))
+            self.validation_preview_cache[record_id] = (cad_pixmap, ori_pixmap)
+        else:
+            cad_pixmap, ori_pixmap = cached
+
+        self._set_preview_pixmap(self.validation_cad_label, cad_pixmap, "Validation CAD")
+        self._set_preview_pixmap(self.validation_ori_label, ori_pixmap, "Validation ORI")
+
+    def clear_validation_preview(self):
+        self.validation_preview_records.clear()
+        self.validation_preview_cache.clear()
+        self.validation_list.clear()
+        self.validation_status_label.setText(
+            "No validation preview yet. Start training with a validation dataset to populate this monitor."
+        )
+        self.validation_meta_label.setText("Validation preview metadata will appear here.")
+        self.validation_cad_label.setText("Validation CAD")
+        self.validation_cad_label.setPixmap(QPixmap())
+        self.validation_ori_label.setText("Validation ORI")
+        self.validation_ori_label.setPixmap(QPixmap())
+
     def refresh_action_state(self):
         train_ready = os.path.isdir(self.dataset_panels["train"].path_edit.text().strip())
         busy = self.is_training or self.is_exporting
@@ -570,3 +701,43 @@ class MainWindow(QMainWindow):
         self.summary_label.setText(status_message)
         self.train_button.setToolTip(train_tooltip)
         self.onnx_button.setToolTip(onnx_tooltip)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        current_item = self.validation_list.currentItem()
+        if current_item is not None:
+            self.on_validation_preview_selected(current_item, None)
+
+    def _create_preview_panel(self, placeholder_text):
+        label = QLabel()
+        label.setAlignment(Qt.AlignCenter)
+        label.setMinimumSize(250, 210)
+        label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        label.setStyleSheet(
+            "QLabel { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #121417, stop:1 #1c2025); color: #ddd5cb; border: 1px solid #2b3037; border-radius: 18px; }"
+        )
+        label.setText(placeholder_text)
+        return label
+
+    def _load_preview_pixmap(self, image_path):
+        if not image_path or not os.path.isfile(image_path):
+            return None
+
+        pixmap = QPixmap(image_path)
+        if pixmap.isNull():
+            return None
+        return pixmap
+
+    def _set_preview_pixmap(self, label, pixmap, fallback_text):
+        if pixmap is None:
+            label.setPixmap(QPixmap())
+            label.setText(fallback_text)
+            return
+
+        scaled = pixmap.scaled(
+            label.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        label.setText("")
+        label.setPixmap(scaled)

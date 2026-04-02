@@ -22,6 +22,7 @@ except Exception as exc:
 class TrainingSignals(QObject):
     started = pyqtSignal(str)
     progress = pyqtSignal(str)
+    validation_preview = pyqtSignal(dict)
     finished = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
