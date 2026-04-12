@@ -29,14 +29,6 @@ ORI_HEIGHT = 480
 ORI_WIDTH = 640
 
 
-def discover_class_names(ori_root):
-    classes = []
-    for entry in sorted(os.scandir(ori_root), key=lambda item: item.name.lower()):
-        if entry.is_dir():
-            classes.append(entry.name)
-    return classes
-
-
 def sorted_image_files(root_dir):
     image_paths = []
     for root, _, files in os.walk(root_dir):
@@ -56,36 +48,43 @@ def collect_paired_samples(root_dir):
     if not os.path.isdir(cad_root) or not os.path.isdir(ori_root):
         raise ValueError(f"Expected 'cad' and 'ori' folders under: {root_dir}")
 
-    classes = discover_class_names(ori_root)
     samples = []
-
-    if classes:
-        for class_idx, class_name in enumerate(classes):
-            ori_class_dir = os.path.join(ori_root, class_name)
-            cad_class_dir = os.path.join(cad_root, class_name)
-            if not os.path.isdir(ori_class_dir) or not os.path.isdir(cad_class_dir):
-                continue
-            _append_paired_samples(samples, ori_class_dir, cad_class_dir, class_idx, class_name)
-        class_to_idx = {name: idx for idx, name in enumerate(classes)}
-    else:
-        _append_paired_samples(samples, ori_root, cad_root, 0, "default")
-        class_to_idx = {"default": 0}
-
-    return samples, class_to_idx
-
-
-def _append_paired_samples(samples, ori_dir, cad_dir, class_idx, class_name):
-    ori_files = sorted_image_files(ori_dir)
-    cad_files = sorted_image_files(cad_dir)
+    ori_files = sorted_image_files(ori_root)
+    cad_files = sorted_image_files(cad_root)
 
     if len(ori_files) != len(cad_files):
         raise ValueError(
-            f"CAD/ORI file count mismatch in group '{class_name}': "
-            f"{len(cad_files)} cad files vs {len(ori_files)} ori files."
+            f"CAD/ORI file count mismatch: {len(cad_files)} cad files vs "
+            f"{len(ori_files)} ori files under {root_dir}."
         )
 
     for cad_path, ori_path in zip(cad_files, ori_files):
-        samples.append((cad_path, ori_path, class_idx))
+        samples.append((cad_path, ori_path))
+
+    return samples
+
+
+def split_paired_samples(samples, train_ratio, validation_ratio, test_ratio, seed=42):
+    total_ratio = train_ratio + validation_ratio + test_ratio
+    if total_ratio <= 0:
+        raise ValueError("At least one split ratio must be greater than 0.")
+
+    shuffled_samples = list(samples)
+    random.Random(seed).shuffle(shuffled_samples)
+
+    total_count = len(shuffled_samples)
+    train_count = int(total_count * (train_ratio / total_ratio))
+    validation_count = int(total_count * (validation_ratio / total_ratio))
+
+    train_samples = shuffled_samples[:train_count]
+    validation_samples = shuffled_samples[train_count:train_count + validation_count]
+    test_samples = shuffled_samples[train_count + validation_count:]
+
+    return {
+        "train": train_samples,
+        "validation": validation_samples,
+        "test": test_samples,
+    }
 
 
 def build_processed_pair(cad_path, ori_path, rotation_transform=None):
@@ -142,18 +141,11 @@ def _resolve_rotation_angle(rotation_transform):
 
 
 class RecursiveImageDataset(Dataset):
-    def __init__(self, root_dir, class_to_idx=None, image_size=DEFAULT_IMAGE_SIZE):
+    def __init__(self, root_dir, samples=None, image_size=DEFAULT_IMAGE_SIZE):
         self.root_dir = root_dir
         self.cad_root = os.path.join(root_dir, "cad")
         self.ori_root = os.path.join(root_dir, "ori")
-        self.samples = []
-        self.has_class_subdirs = False
-
-        if class_to_idx is None:
-            self.samples, self.class_to_idx = collect_paired_samples(root_dir)
-        else:
-            self.class_to_idx = dict(class_to_idx)
-            self.samples, _ = collect_paired_samples(root_dir)
+        self.samples = list(samples) if samples is not None else collect_paired_samples(root_dir)
 
         self.to_tensor = transforms.ToTensor()
         self.rotation = (-10.0, 10.0)
@@ -165,13 +157,13 @@ class RecursiveImageDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
-        cad_path, ori_path, target = self.samples[index]
+        cad_path, ori_path = self.samples[index]
         cad_image, ori_image = build_processed_pair(cad_path, ori_path, self.rotation)
         cad_tensor = self.to_tensor(cad_image)
         ori_tensor = self.to_tensor(ori_image)
         fused_tensor = self._concat_channels(cad_tensor, ori_tensor)
 
-        return fused_tensor, cad_tensor, ori_tensor, target
+        return fused_tensor, cad_tensor, ori_tensor
 
     def _concat_channels(self, cad_tensor, ori_tensor):
         import torch

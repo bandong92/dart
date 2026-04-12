@@ -1,8 +1,11 @@
 import os
 from collections import deque
 
+from data_pipeline import collect_paired_samples, split_paired_samples
+from training import ExportOnnxTask, TORCH_IMPORT_ERROR, TrainingTask, torch
+
 from PyQt5.QtCore import QObject, QRunnable, Qt, QThreadPool, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
@@ -20,19 +23,15 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
-    QTextEdit,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from data_pipeline import collect_paired_samples
-from training import ExportOnnxTask, TORCH_IMPORT_ERROR, TrainingTask, torch
-
 
 PREVIEW_SAMPLE_LIMIT = 48
 VALIDATION_BROWSER_BATCH_SIZE = 256
-SUPPORTED_DATASETS = ("train", "validation", "test")
 
 
 DARK_STYLESHEET = """
@@ -64,7 +63,7 @@ QTabBar::tab {
     color: #b8aa95;
     border: 1px solid #272b31;
     padding: 8px 16px;
-    min-width: 110px;
+    min-width: 130px;
     border-top-left-radius: 10px;
     border-top-right-radius: 10px;
     margin-right: 6px;
@@ -180,11 +179,11 @@ class DatasetScanTask(QRunnable):
 
     def run(self):
         try:
-            pairs, _ = collect_paired_samples(self.folder_path)
+            pairs = collect_paired_samples(self.folder_path)
             total_count = len(pairs)
             sampled_pairs = deque(maxlen=PREVIEW_SAMPLE_LIMIT)
 
-            for index, (cad_path, ori_path, _) in enumerate(pairs, start=1):
+            for index, (cad_path, ori_path) in enumerate(pairs, start=1):
                 if len(sampled_pairs) < PREVIEW_SAMPLE_LIMIT:
                     sampled_pairs.append((cad_path, ori_path))
                     self.signals.sample.emit(self.dataset_name, cad_path, ori_path)
@@ -212,16 +211,26 @@ class ValidationBrowserSignals(QObject):
 
 
 class ValidationBrowserTask(QRunnable):
-    def __init__(self, folder_path):
+    def __init__(self, folder_path, train_ratio, validation_ratio, test_ratio, split_seed=42):
         super().__init__()
         self.folder_path = folder_path
+        self.train_ratio = train_ratio
+        self.validation_ratio = validation_ratio
+        self.test_ratio = test_ratio
+        self.split_seed = split_seed
         self.signals = ValidationBrowserSignals()
 
     def run(self):
         try:
-            pairs, _ = collect_paired_samples(self.folder_path)
+            pairs = split_paired_samples(
+                collect_paired_samples(self.folder_path),
+                self.train_ratio,
+                self.validation_ratio,
+                self.test_ratio,
+                seed=self.split_seed,
+            )["validation"]
             batch = []
-            for index, (cad_path, ori_path, _label) in enumerate(pairs, start=1):
+            for index, (cad_path, ori_path) in enumerate(pairs, start=1):
                 batch.append(
                     {
                         "index": index,
@@ -259,7 +268,7 @@ class DatasetPanel(QGroupBox):
         path_row = QHBoxLayout()
         path_row.setSpacing(10)
         self.path_edit = QLineEdit()
-        self.path_edit.setPlaceholderText(f"{self.dataset_name} data folder")
+        self.path_edit.setPlaceholderText("Dataset folder containing cad and ori subfolders")
         self.path_edit.setMinimumWidth(220)
         self.path_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         browse_button = QPushButton("Browse")
@@ -316,8 +325,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.thread_pool = QThreadPool.globalInstance()
-        self.dataset_panels = {}
+        self.dataset_panel = None
         self.validation_browser_pixmap_cache = {}
+        self.test_result_pixmap_cache = {}
+        self.onnx_result_pixmap_cache = {}
         self.is_training = False
         self.is_exporting = False
         self.onnx_export_ready = False
@@ -374,28 +385,41 @@ class MainWindow(QMainWindow):
         self.lr_input.setRange(0.000001, 10.0)
         self.lr_input.setSingleStep(0.0001)
         self.lr_input.setValue(0.001)
+        self.train_ratio_input = QDoubleSpinBox()
+        self.train_ratio_input.setRange(0.0, 100.0)
+        self.train_ratio_input.setDecimals(1)
+        self.train_ratio_input.setSuffix(" %")
+        self.train_ratio_input.setValue(80.0)
+        self.validation_ratio_input = QDoubleSpinBox()
+        self.validation_ratio_input.setRange(0.0, 100.0)
+        self.validation_ratio_input.setDecimals(1)
+        self.validation_ratio_input.setSuffix(" %")
+        self.validation_ratio_input.setValue(10.0)
+        self.test_ratio_input = QDoubleSpinBox()
+        self.test_ratio_input.setRange(0.0, 100.0)
+        self.test_ratio_input.setDecimals(1)
+        self.test_ratio_input.setSuffix(" %")
+        self.test_ratio_input.setValue(10.0)
+
+        self.train_ratio_input.valueChanged.connect(self.on_split_ratio_changed)
+        self.validation_ratio_input.valueChanged.connect(self.on_split_ratio_changed)
+        self.test_ratio_input.valueChanged.connect(self.on_split_ratio_changed)
 
         config_layout.addRow("Epoch", self.epoch_input)
         config_layout.addRow("Batch Size", self.batch_input)
         config_layout.addRow("Learning Rate", self.lr_input)
+        config_layout.addRow("Train Ratio", self.train_ratio_input)
+        config_layout.addRow("Validation Ratio", self.validation_ratio_input)
+        config_layout.addRow("Test Ratio", self.test_ratio_input)
         config_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         left_layout.addWidget(config_group, stretch=0)
-
-        dataset_tabs = QTabWidget()
-        dataset_tabs.setDocumentMode(True)
-        dataset_tabs.setTabPosition(QTabWidget.North)
-        dataset_tabs.setMovable(False)
-        dataset_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        for dataset_name in SUPPORTED_DATASETS:
-            panel = DatasetPanel(dataset_name)
-            panel.path_requested.connect(self.select_folder)
-            self.dataset_panels[dataset_name] = panel
-            dataset_tabs.addTab(panel, dataset_name.capitalize())
 
         dataset_group = QGroupBox("Dataset Sources")
         dataset_layout = QVBoxLayout(dataset_group)
         dataset_layout.setContentsMargins(10, 18, 10, 10)
-        dataset_layout.addWidget(dataset_tabs)
+        self.dataset_panel = DatasetPanel("dataset")
+        self.dataset_panel.path_requested.connect(self.select_folder)
+        dataset_layout.addWidget(self.dataset_panel)
         dataset_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_layout.addWidget(dataset_group, stretch=1)
 
@@ -413,7 +437,7 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(button_row)
 
         self.summary_label = QLabel(
-            "Select a valid train dataset folder to enable training."
+            "Select a valid dataset folder and split ratios to enable training."
         )
         self.summary_label.setWordWrap(True)
         self.summary_label.setStyleSheet("color: #9f9589; padding: 4px 2px;")
@@ -431,6 +455,10 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(12)
+
+        result_tabs = QTabWidget()
+        result_tabs.setDocumentMode(True)
+        result_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         validation_card = QFrame()
         validation_card.setObjectName("previewCard")
@@ -451,7 +479,7 @@ class MainWindow(QMainWindow):
         validation_layout.addWidget(validation_hint)
 
         self.validation_status_label = QLabel(
-            "Select a validation dataset folder to populate this browser."
+            "Select a dataset folder to populate the validation split browser."
         )
         self.validation_status_label.setWordWrap(True)
         self.validation_status_label.setStyleSheet(
@@ -481,7 +509,108 @@ class MainWindow(QMainWindow):
         )
         validation_layout.addWidget(self.validation_browser_meta_label)
 
-        right_layout.addWidget(validation_card, stretch=1)
+        test_card = QFrame()
+        test_card.setObjectName("previewCard")
+        test_layout = QVBoxLayout(test_card)
+        test_layout.setContentsMargins(18, 18, 18, 18)
+        test_layout.setSpacing(12)
+
+        test_title = QLabel("Test Results")
+        test_title.setStyleSheet("font-size: 15pt; font-weight: 700; color: #f4efe7;")
+        test_layout.addWidget(test_title)
+
+        test_hint = QLabel(
+            "After training finishes, test CAD images transformed by the STN model appear here. "
+            "Only the selected result is loaded into the preview."
+        )
+        test_hint.setWordWrap(True)
+        test_hint.setStyleSheet("color: #a79d90;")
+        test_layout.addWidget(test_hint)
+
+        self.test_result_status_label = QLabel(
+            "No test result yet. Start training with a non-zero test ratio."
+        )
+        self.test_result_status_label.setWordWrap(True)
+        self.test_result_status_label.setStyleSheet(
+            "color: #aea397; background: #121518; border: 1px solid #262b31; border-radius: 10px; padding: 8px 10px;"
+        )
+        test_layout.addWidget(self.test_result_status_label)
+
+        self.test_result_list = QListWidget()
+        self.test_result_list.setMinimumHeight(220)
+        self.test_result_list.setUniformItemSizes(True)
+        self.test_result_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.test_result_list.currentItemChanged.connect(self.on_test_result_selected)
+        test_layout.addWidget(self.test_result_list, stretch=1)
+
+        test_image_row = QHBoxLayout()
+        test_image_row.setSpacing(12)
+        self.test_aligned_label = self._create_preview_panel("STN Output")
+        self.test_ori_label = self._create_preview_panel("ORI Target")
+        test_image_row.addWidget(self.test_aligned_label, stretch=1)
+        test_image_row.addWidget(self.test_ori_label, stretch=1)
+        test_layout.addLayout(test_image_row, stretch=1)
+
+        self.test_result_meta_label = QLabel("Test result metadata will appear here.")
+        self.test_result_meta_label.setWordWrap(True)
+        self.test_result_meta_label.setStyleSheet(
+            "color: #a99d91; background: #121518; border: 1px solid #262b31; border-radius: 12px; padding: 10px 12px;"
+        )
+        test_layout.addWidget(self.test_result_meta_label)
+
+        onnx_card = QFrame()
+        onnx_card.setObjectName("previewCard")
+        onnx_layout = QVBoxLayout(onnx_card)
+        onnx_layout.setContentsMargins(18, 18, 18, 18)
+        onnx_layout.setSpacing(12)
+
+        onnx_title = QLabel("ONNX Results")
+        onnx_title.setStyleSheet("font-size: 15pt; font-weight: 700; color: #f4efe7;")
+        onnx_layout.addWidget(onnx_title)
+
+        onnx_hint = QLabel(
+            "After ONNX export finishes, the exported ONNX model runs on the same test split. "
+            "Select a result to compare ONNX output with the ORI target."
+        )
+        onnx_hint.setWordWrap(True)
+        onnx_hint.setStyleSheet("color: #a79d90;")
+        onnx_layout.addWidget(onnx_hint)
+
+        self.onnx_result_status_label = QLabel(
+            "No ONNX result yet. Export ONNX after training to populate this view."
+        )
+        self.onnx_result_status_label.setWordWrap(True)
+        self.onnx_result_status_label.setStyleSheet(
+            "color: #aea397; background: #121518; border: 1px solid #262b31; border-radius: 10px; padding: 8px 10px;"
+        )
+        onnx_layout.addWidget(self.onnx_result_status_label)
+
+        self.onnx_result_list = QListWidget()
+        self.onnx_result_list.setMinimumHeight(220)
+        self.onnx_result_list.setUniformItemSizes(True)
+        self.onnx_result_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.onnx_result_list.currentItemChanged.connect(self.on_onnx_result_selected)
+        onnx_layout.addWidget(self.onnx_result_list, stretch=1)
+
+        onnx_image_row = QHBoxLayout()
+        onnx_image_row.setSpacing(12)
+        self.onnx_aligned_label = self._create_preview_panel("ONNX Output")
+        self.onnx_ori_label = self._create_preview_panel("ORI Target")
+        onnx_image_row.addWidget(self.onnx_aligned_label, stretch=1)
+        onnx_image_row.addWidget(self.onnx_ori_label, stretch=1)
+        onnx_layout.addLayout(onnx_image_row, stretch=1)
+
+        self.onnx_result_meta_label = QLabel("ONNX result metadata will appear here.")
+        self.onnx_result_meta_label.setWordWrap(True)
+        self.onnx_result_meta_label.setStyleSheet(
+            "color: #a99d91; background: #121518; border: 1px solid #262b31; border-radius: 12px; padding: 10px 12px;"
+        )
+        onnx_layout.addWidget(self.onnx_result_meta_label)
+
+        result_tabs.addTab(validation_card, "Validation Split")
+        result_tabs.addTab(test_card, "Test Results")
+        result_tabs.addTab(onnx_card, "ONNX Results")
+        right_layout.addWidget(result_tabs, stretch=1)
 
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
@@ -495,13 +624,13 @@ class MainWindow(QMainWindow):
     def select_folder(self, dataset_name):
         folder_path = QFileDialog.getExistingDirectory(
             self,
-            f"Select {dataset_name} dataset folder",
-            self.dataset_panels[dataset_name].path_edit.text() or os.getcwd(),
+            "Select dataset folder",
+            self.dataset_panel.path_edit.text() or os.getcwd(),
         )
         if not folder_path:
             return
 
-        panel = self.dataset_panels[dataset_name]
+        panel = self.dataset_panel
         panel.set_path(folder_path)
         panel.clear_samples()
         panel.set_status("Scanning in background...")
@@ -513,37 +642,47 @@ class MainWindow(QMainWindow):
         task.signals.failed.connect(self.on_scan_failed)
         self.thread_pool.start(task)
 
-        if dataset_name == "validation":
-            self.start_validation_browser_scan(folder_path)
+        self.start_validation_browser_scan(folder_path)
 
         self.refresh_action_state()
 
     def start_validation_browser_scan(self, folder_path):
         self.clear_validation_browser()
-        self.validation_status_label.setText("Scanning validation pairs in background...")
-        task = ValidationBrowserTask(folder_path)
+        self.validation_status_label.setText("Scanning validation split pairs in background...")
+        task = ValidationBrowserTask(
+            folder_path,
+            self.train_ratio_input.value(),
+            self.validation_ratio_input.value(),
+            self.test_ratio_input.value(),
+        )
         task.signals.batch.connect(self.on_validation_browser_batch)
         task.signals.finished.connect(self.on_validation_browser_finished)
         task.signals.failed.connect(self.on_validation_browser_failed)
         self.thread_pool.start(task)
 
+    def on_split_ratio_changed(self):
+        self.refresh_action_state()
+        dataset_path = self.dataset_panel.path_edit.text().strip()
+        if os.path.isdir(dataset_path):
+            self.start_validation_browser_scan(dataset_path)
+
     def on_scan_progress(self, dataset_name, count, sample_count):
-        self.dataset_panels[dataset_name].set_status(
+        self.dataset_panel.set_status(
             f"Scanning... {count:,} images found, {sample_count} samples loaded."
         )
 
     def on_scan_sample(self, dataset_name, cad_path, ori_path):
-        self.dataset_panels[dataset_name].add_sample(cad_path, ori_path)
+        self.dataset_panel.add_sample(cad_path, ori_path)
 
     def on_scan_finished(self, dataset_name, count):
-        self.dataset_panels[dataset_name].set_status(
+        self.dataset_panel.set_status(
             f"Ready. {count:,} images detected. Showing sampled previews only for smooth performance."
         )
         self.refresh_action_state()
 
     def on_scan_failed(self, dataset_name, error_message):
-        self.dataset_panels[dataset_name].set_status("Scan failed.")
-        QMessageBox.critical(self, f"{dataset_name.capitalize()} scan failed", error_message)
+        self.dataset_panel.set_status("Scan failed.")
+        QMessageBox.critical(self, "Dataset scan failed", error_message)
         self.refresh_action_state()
 
     def start_training(self):
@@ -558,18 +697,27 @@ class MainWindow(QMainWindow):
             )
             return
 
-        train_path = self.dataset_panels["train"].path_edit.text().strip()
-        validation_path = self.dataset_panels["validation"].path_edit.text().strip()
-        test_path = self.dataset_panels["test"].path_edit.text().strip()
+        dataset_path = self.dataset_panel.path_edit.text().strip()
+        train_ratio = self.train_ratio_input.value()
+        validation_ratio = self.validation_ratio_input.value()
+        test_ratio = self.test_ratio_input.value()
 
-        if not train_path or not os.path.isdir(train_path):
-            QMessageBox.warning(self, "Missing train path", "Select a valid train dataset folder first.")
+        if not dataset_path or not os.path.isdir(dataset_path):
+            QMessageBox.warning(self, "Missing dataset path", "Select a valid dataset folder first.")
+            return
+        if train_ratio <= 0:
+            QMessageBox.warning(self, "Invalid split ratio", "Train ratio must be greater than 0.")
+            return
+        if train_ratio + validation_ratio + test_ratio <= 0:
+            QMessageBox.warning(self, "Invalid split ratio", "At least one split ratio must be greater than 0.")
             return
 
         config = {
-            "train_path": train_path,
-            "validation_path": validation_path,
-            "test_path": test_path,
+            "dataset_path": dataset_path,
+            "train_ratio": train_ratio,
+            "validation_ratio": validation_ratio,
+            "test_ratio": test_ratio,
+            "split_seed": 42,
             "epochs": self.epoch_input.value(),
             "batch_size": self.batch_input.value(),
             "learning_rate": self.lr_input.value(),
@@ -580,6 +728,7 @@ class MainWindow(QMainWindow):
         self.latest_checkpoint_path = None
         self.best_checkpoint_path = None
         self.log_view.clear()
+        self.clear_test_results()
         self.append_log("Starting training...")
         self.summary_label.setText("Training in progress. Checkpoints will be saved automatically to outputs.")
         self.refresh_action_state()
@@ -588,6 +737,7 @@ class MainWindow(QMainWindow):
         task.signals.started.connect(self.append_log)
         task.signals.progress.connect(self.append_log)
         task.signals.validation_preview.connect(self.on_validation_preview)
+        task.signals.test_result_batch.connect(self.on_test_result_batch)
         task.signals.finished.connect(self.on_training_finished)
         task.signals.failed.connect(self.on_training_failed)
         self.thread_pool.start(task)
@@ -629,12 +779,15 @@ class MainWindow(QMainWindow):
         output_path = os.path.join(output_dir, "dart_stn.onnx")
 
         self.is_exporting = True
+        self.clear_onnx_results()
         self.append_log("Starting ONNX export...")
         self.summary_label.setText("Exporting the current best checkpoint to ONNX.")
         self.refresh_action_state()
 
         task = ExportOnnxTask(checkpoint_path, output_path)
         task.signals.started.connect(self.append_log)
+        task.signals.progress.connect(self.append_log)
+        task.signals.onnx_result_batch.connect(self.on_onnx_result_batch)
         task.signals.finished.connect(self.on_export_finished)
         task.signals.failed.connect(self.on_export_failed)
         self.thread_pool.start(task)
@@ -642,6 +795,10 @@ class MainWindow(QMainWindow):
     def on_export_finished(self, result):
         self.is_exporting = False
         self.append_log(f"ONNX export complete: {result['onnx_path']}")
+        if result.get("onnx_result_count", 0):
+            self.append_log(
+                f"ONNX verification images saved: {result['onnx_result_count']:,} items in {result['onnx_results_dir']}"
+            )
         self.summary_label.setText("ONNX export finished successfully.")
         QMessageBox.information(self, "Export complete", f"ONNX saved to:\n{result['onnx_path']}")
         self.refresh_action_state()
@@ -681,7 +838,7 @@ class MainWindow(QMainWindow):
 
     def on_validation_browser_finished(self, total_count):
         self.validation_status_label.setText(
-            f"Validation browser ready. {total_count:,} pairs available in scroll view."
+            f"Validation split browser ready. {total_count:,} pairs available in scroll view."
         )
 
     def on_validation_browser_failed(self, error_message):
@@ -704,21 +861,106 @@ class MainWindow(QMainWindow):
         self._set_preview_pixmap(self.validation_browser_cad_label, cad_pixmap, "Validation CAD")
         self._set_preview_pixmap(self.validation_browser_ori_label, ori_pixmap, "Validation ORI")
 
+    def on_test_result_batch(self, batch):
+        for entry in batch:
+            title = f"{entry['index']:06d} | loss {entry['loss']:.5f} | {os.path.basename(entry['ori_path'])}"
+            item = QListWidgetItem(title)
+            item.setToolTip(
+                f"STN Output: {entry['aligned_path']}\nCAD: {entry['cad_path']}\nORI: {entry['ori_path']}"
+            )
+            item.setData(Qt.UserRole, entry)
+            self.test_result_list.addItem(item)
+
+        self.test_result_status_label.setText(
+            f"Loading STN-transformed test results... {self.test_result_list.count():,} items ready."
+        )
+        if self.test_result_list.count() == len(batch):
+            self.test_result_list.setCurrentRow(0)
+
+    def on_test_result_selected(self, current_item, _previous_item):
+        if not current_item:
+            return
+
+        entry = current_item.data(Qt.UserRole)
+        self.test_result_meta_label.setText(
+            f"Index: {entry['index']}\nLoss: {entry['loss']:.6f}\n"
+            f"STN Output: {entry['aligned_path']}\nCAD: {entry['cad_path']}\nORI: {entry['ori_path']}"
+        )
+        aligned_pixmap = self._get_test_result_pixmap(entry["aligned_path"])
+        ori_pixmap = self._get_test_result_pixmap(entry["ori_path"])
+        self._set_preview_pixmap(self.test_aligned_label, aligned_pixmap, "STN Output")
+        self._set_preview_pixmap(self.test_ori_label, ori_pixmap, "ORI Target")
+
+    def on_onnx_result_batch(self, batch):
+        for entry in batch:
+            title = f"{entry['index']:06d} | loss {entry['loss']:.5f} | {os.path.basename(entry['ori_path'])}"
+            item = QListWidgetItem(title)
+            item.setToolTip(
+                f"ONNX Output: {entry['aligned_path']}\nCAD: {entry['cad_path']}\nORI: {entry['ori_path']}"
+            )
+            item.setData(Qt.UserRole, entry)
+            self.onnx_result_list.addItem(item)
+
+        self.onnx_result_status_label.setText(
+            f"Loading ONNX-transformed test results... {self.onnx_result_list.count():,} items ready."
+        )
+        if self.onnx_result_list.count() == len(batch):
+            self.onnx_result_list.setCurrentRow(0)
+
+    def on_onnx_result_selected(self, current_item, _previous_item):
+        if not current_item:
+            return
+
+        entry = current_item.data(Qt.UserRole)
+        self.onnx_result_meta_label.setText(
+            f"Index: {entry['index']}\nLoss: {entry['loss']:.6f}\n"
+            f"ONNX Output: {entry['aligned_path']}\nCAD: {entry['cad_path']}\nORI: {entry['ori_path']}"
+        )
+        aligned_pixmap = self._get_onnx_result_pixmap(entry["aligned_path"])
+        ori_pixmap = self._get_onnx_result_pixmap(entry["ori_path"])
+        self._set_preview_pixmap(self.onnx_aligned_label, aligned_pixmap, "ONNX Output")
+        self._set_preview_pixmap(self.onnx_ori_label, ori_pixmap, "ORI Target")
+
     def clear_validation_browser(self):
         self.validation_browser_item_count = 0
         self.validation_browser_list.clear()
         self.validation_browser_pixmap_cache.clear()
-        self.validation_status_label.setText("Select a validation dataset folder to populate this browser.")
+        self.validation_status_label.setText("Select a dataset folder to populate the validation split browser.")
         self.validation_browser_meta_label.setText("Validation pair metadata will appear here.")
         self.validation_browser_cad_label.setText("Validation CAD")
         self.validation_browser_cad_label.setPixmap(QPixmap())
         self.validation_browser_ori_label.setText("Validation ORI")
         self.validation_browser_ori_label.setPixmap(QPixmap())
 
+    def clear_test_results(self):
+        self.test_result_list.clear()
+        self.test_result_pixmap_cache.clear()
+        self.test_result_status_label.setText("No test result yet. Start training with a non-zero test ratio.")
+        self.test_result_meta_label.setText("Test result metadata will appear here.")
+        self.test_aligned_label.setText("STN Output")
+        self.test_aligned_label.setPixmap(QPixmap())
+        self.test_ori_label.setText("ORI Target")
+        self.test_ori_label.setPixmap(QPixmap())
+
+    def clear_onnx_results(self):
+        self.onnx_result_list.clear()
+        self.onnx_result_pixmap_cache.clear()
+        self.onnx_result_status_label.setText("No ONNX result yet. Export ONNX after training to populate this view.")
+        self.onnx_result_meta_label.setText("ONNX result metadata will appear here.")
+        self.onnx_aligned_label.setText("ONNX Output")
+        self.onnx_aligned_label.setPixmap(QPixmap())
+        self.onnx_ori_label.setText("ORI Target")
+        self.onnx_ori_label.setPixmap(QPixmap())
+
     def refresh_action_state(self):
-        train_ready = os.path.isdir(self.dataset_panels["train"].path_edit.text().strip())
+        dataset_ready = os.path.isdir(self.dataset_panel.path_edit.text().strip())
+        ratios_ready = self.train_ratio_input.value() > 0 and (
+            self.train_ratio_input.value()
+            + self.validation_ratio_input.value()
+            + self.test_ratio_input.value()
+        ) > 0
         busy = self.is_training or self.is_exporting
-        self.train_button.setEnabled(train_ready and not busy)
+        self.train_button.setEnabled(dataset_ready and ratios_ready and not busy)
         self.onnx_button.setEnabled(self.onnx_export_ready and not busy)
 
         if self.is_training:
@@ -729,15 +971,19 @@ class MainWindow(QMainWindow):
             status_message = "ONNX export in progress."
             train_tooltip = "Wait for ONNX export to finish."
             onnx_tooltip = "ONNX export is currently running."
-        elif not train_ready:
+        elif not dataset_ready:
             status_message = (
-                "Train is disabled: select a valid train dataset folder with cad and ori subfolders."
+                "Train is disabled: select a valid dataset folder with cad and ori subfolders."
             )
-            train_tooltip = "Set the Train dataset path to a valid folder first."
+            train_tooltip = "Set the dataset path to a valid folder first."
+            onnx_tooltip = "Run training first to create a checkpoint for ONNX export."
+        elif not ratios_ready:
+            status_message = "Train is disabled: train ratio must be greater than 0."
+            train_tooltip = "Set Train Ratio to a value greater than 0."
             onnx_tooltip = "Run training first to create a checkpoint for ONNX export."
         elif not self.onnx_export_ready:
             status_message = (
-                "Train is ready. ONNX export is disabled until a training run creates a checkpoint."
+                "Train is ready. Dataset will be split by the configured ratios before training."
             )
             train_tooltip = "Start training with the current dataset paths and options."
             onnx_tooltip = "Run training first to enable ONNX export."
@@ -755,6 +1001,12 @@ class MainWindow(QMainWindow):
         current_browser_item = self.validation_browser_list.currentItem()
         if current_browser_item is not None:
             self.on_validation_browser_selected(current_browser_item, None)
+        current_test_item = self.test_result_list.currentItem()
+        if current_test_item is not None:
+            self.on_test_result_selected(current_test_item, None)
+        current_onnx_item = self.onnx_result_list.currentItem()
+        if current_onnx_item is not None:
+            self.on_onnx_result_selected(current_onnx_item, None)
 
     def _create_preview_panel(self, placeholder_text):
         label = QLabel()
@@ -789,6 +1041,36 @@ class MainWindow(QMainWindow):
             self.validation_browser_pixmap_cache.pop(oldest_key, None)
 
         self.validation_browser_pixmap_cache[image_path] = pixmap
+        return pixmap
+
+    def _get_test_result_pixmap(self, image_path):
+        if image_path in self.test_result_pixmap_cache:
+            return self.test_result_pixmap_cache[image_path]
+
+        pixmap = self._load_preview_pixmap(image_path)
+        if pixmap is None:
+            return None
+
+        if len(self.test_result_pixmap_cache) >= 16:
+            oldest_key = next(iter(self.test_result_pixmap_cache))
+            self.test_result_pixmap_cache.pop(oldest_key, None)
+
+        self.test_result_pixmap_cache[image_path] = pixmap
+        return pixmap
+
+    def _get_onnx_result_pixmap(self, image_path):
+        if image_path in self.onnx_result_pixmap_cache:
+            return self.onnx_result_pixmap_cache[image_path]
+
+        pixmap = self._load_preview_pixmap(image_path)
+        if pixmap is None:
+            return None
+
+        if len(self.onnx_result_pixmap_cache) >= 16:
+            oldest_key = next(iter(self.onnx_result_pixmap_cache))
+            self.onnx_result_pixmap_cache.pop(oldest_key, None)
+
+        self.onnx_result_pixmap_cache[image_path] = pixmap
         return pixmap
 
     def _append_validation_browser_entry(self, entry, auto_select=None):
