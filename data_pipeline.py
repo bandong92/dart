@@ -2,16 +2,19 @@ import os
 import random
 
 try:
+    import torch
     import torchvision.transforms.functional as TF
-    from PIL import Image
     from torch.utils.data import DataLoader, Dataset
     from torchvision import transforms
+    from torchvision.io import ImageReadMode, read_image
 except Exception:
+    torch = None
     TF = None
-    Image = None
     DataLoader = None
     Dataset = object
     transforms = None
+    ImageReadMode = None
+    read_image = None
 
 
 IMAGE_EXTENSIONS = {
@@ -88,32 +91,34 @@ def split_paired_samples(samples, train_ratio, validation_ratio, test_ratio, see
 
 
 def build_processed_pair(cad_path, ori_path, rotation_transform=None):
-    with Image.open(cad_path) as cad_image, Image.open(ori_path) as ori_image:
-        cad_image = cad_image.convert("RGB")
-        ori_image = ori_image.convert("RGB")
+    cad_image = read_image(cad_path, mode=ImageReadMode.RGB)
+    ori_image = read_image(ori_path, mode=ImageReadMode.RGB)
+    cad_image = TF.convert_image_dtype(cad_image, torch.float32)
+    ori_image = TF.convert_image_dtype(ori_image, torch.float32)
 
-        ori_width, ori_height = ori_image.size
-        if (ori_height, ori_width) != (ORI_HEIGHT, ORI_WIDTH):
-            raise ValueError(
-                f"ORI image must be {ORI_HEIGHT}x{ORI_WIDTH}, got {ori_height}x{ori_width}: {ori_path}"
-            )
+    ori_height, ori_width = ori_image.shape[1:]
+    if (ori_height, ori_width) != (ORI_HEIGHT, ORI_WIDTH):
+        raise ValueError(
+            f"ORI image must be {ORI_HEIGHT}x{ORI_WIDTH}, got {ori_height}x{ori_width}: {ori_path}"
+        )
 
-        if rotation_transform is not None:
-            cad_image = rotate_cad_image(cad_image, rotation_transform)
-        if cad_image.height < ori_height or cad_image.width < ori_width:
-            raise ValueError(
-                f"CAD image must be larger than ORI image for center crop: {cad_path}"
-            )
+    if rotation_transform is not None:
+        cad_image = rotate_cad_image(cad_image, rotation_transform)
+    cad_height, cad_width = cad_image.shape[1:]
+    if cad_height < ori_height or cad_width < ori_width:
+        raise ValueError(
+            f"CAD image must be larger than ORI image for center crop: {cad_path}"
+        )
 
-        crop_size = (ori_height, ori_width)
-        cad_image = TF.center_crop(cad_image, crop_size)
-        return cad_image.copy(), ori_image.copy()
+    crop_size = (ori_height, ori_width)
+    cad_image = TF.center_crop(cad_image, crop_size)
+    return cad_image.contiguous(), ori_image.contiguous()
 
 
 def rotate_cad_image(cad_image, rotation_transform):
     angle = _resolve_rotation_angle(rotation_transform)
     interpolation = getattr(transforms, "InterpolationMode", None)
-    bilinear = interpolation.BILINEAR if interpolation is not None else Image.BILINEAR
+    bilinear = interpolation.BILINEAR if interpolation is not None else 2
     return TF.rotate(
         cad_image,
         angle=angle,
@@ -147,7 +152,6 @@ class RecursiveImageDataset(Dataset):
         self.ori_root = os.path.join(root_dir, "ori")
         self.samples = list(samples) if samples is not None else collect_paired_samples(root_dir)
 
-        self.to_tensor = transforms.ToTensor()
         self.rotation = (-10.0, 10.0)
 
         if not self.samples:
@@ -158,25 +162,26 @@ class RecursiveImageDataset(Dataset):
 
     def __getitem__(self, index):
         cad_path, ori_path = self.samples[index]
-        cad_image, ori_image = build_processed_pair(cad_path, ori_path, self.rotation)
-        cad_tensor = self.to_tensor(cad_image)
-        ori_tensor = self.to_tensor(ori_image)
+        cad_tensor, ori_tensor = build_processed_pair(cad_path, ori_path, self.rotation)
         fused_tensor = self._concat_channels(cad_tensor, ori_tensor)
 
         return fused_tensor, cad_tensor, ori_tensor
 
     def _concat_channels(self, cad_tensor, ori_tensor):
-        import torch
-
         return torch.cat([cad_tensor, ori_tensor], dim=0)
 
 
 def build_dataloader(dataset, batch_size, shuffle, pin_memory):
-    num_workers = min(4, max(0, (os.cpu_count() or 1) - 1))
-    return DataLoader(
-        dataset,
+    cpu_count = os.cpu_count() or 1
+    num_workers = min(8, max(0, cpu_count - 1))
+    loader_kwargs = dict(
+        dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
+    return DataLoader(**loader_kwargs)
