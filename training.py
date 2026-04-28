@@ -133,25 +133,57 @@ class TrainingTask(QRunnable):
             seed=split_seed,
         )
 
-        train_dataset = RecursiveImageDataset(dataset_path, samples=split_samples["train"])
+        train_dataset = RecursiveImageDataset(
+            dataset_path,
+            samples=split_samples["train"],
+            rotation=(-10.0, 10.0),
+            cache_mode="source",
+        )
         validation_dataset = None
         if split_samples["validation"]:
-            validation_dataset = RecursiveImageDataset(dataset_path, samples=split_samples["validation"])
+            validation_dataset = RecursiveImageDataset(
+                dataset_path,
+                samples=split_samples["validation"],
+                rotation=None,
+                cache_mode="processed",
+            )
 
         test_dataset = None
         if split_samples["test"]:
-            test_dataset = RecursiveImageDataset(dataset_path, samples=split_samples["test"])
+            test_dataset = RecursiveImageDataset(
+                dataset_path,
+                samples=split_samples["test"],
+                rotation=None,
+                cache_mode="processed",
+            )
 
         pin_memory = torch.cuda.is_available()
+        cpu_count = os.cpu_count() or 1
+        train_workers = min(12, max(0, cpu_count - 1))
+        eval_workers = min(8, max(0, max(1, cpu_count // 2)))
 
-        train_loader = build_dataloader(train_dataset, batch_size, True, pin_memory)
+        train_loader = build_dataloader(
+            train_dataset, batch_size, True, pin_memory, num_workers=train_workers
+        )
         validation_loader = None
         if validation_dataset is not None:
-            validation_loader = build_dataloader(validation_dataset, batch_size, False, pin_memory)
+            validation_loader = build_dataloader(
+                validation_dataset,
+                batch_size,
+                False,
+                pin_memory,
+                num_workers=eval_workers,
+            )
 
         test_loader = None
         if test_dataset is not None:
-            test_loader = build_dataloader(test_dataset, batch_size, False, pin_memory)
+            test_loader = build_dataloader(
+                test_dataset,
+                batch_size,
+                False,
+                pin_memory,
+                num_workers=eval_workers,
+            )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = STNAligner().to(device)
@@ -190,7 +222,9 @@ class TrainingTask(QRunnable):
         best_validation_loss = float("inf")
         history = []
         self.signals.progress.emit(
-            f"Self-supervised training started on {device.type.upper()} with {len(train_dataset):,} training pairs."
+            f"Self-supervised training started on {device.type.upper()} with {len(train_dataset):,} training pairs. "
+            f"train workers={train_workers}, eval workers={eval_workers}, "
+            f"train cache=source, eval cache=processed."
         )
 
         for epoch in range(1, epochs + 1):
@@ -443,7 +477,12 @@ class ExportOnnxTask(QRunnable):
 
         os.makedirs(output_dir, exist_ok=True)
         session = ort.InferenceSession(self.output_path, providers=["CPUExecutionProvider"])
-        dataset = RecursiveImageDataset(dataset_path, samples=test_samples)
+        dataset = RecursiveImageDataset(
+            dataset_path,
+            samples=test_samples,
+            rotation=None,
+            cache_mode="processed",
+        )
         result_batch = []
         self.signals.progress.emit("Running ONNX model on test split images...")
 

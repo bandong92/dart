@@ -1,3 +1,4 @@
+import hashlib
 import os
 import random
 
@@ -30,6 +31,7 @@ IMAGE_EXTENSIONS = {
 DEFAULT_IMAGE_SIZE = 128
 ORI_HEIGHT = 480
 ORI_WIDTH = 640
+CACHE_DIR_NAME = "_dart_cache"
 
 
 def sorted_image_files(root_dir):
@@ -93,6 +95,10 @@ def split_paired_samples(samples, train_ratio, validation_ratio, test_ratio, see
 def build_processed_pair(cad_path, ori_path, rotation_transform=None):
     cad_image = read_image(cad_path, mode=ImageReadMode.RGB)
     ori_image = read_image(ori_path, mode=ImageReadMode.RGB)
+    return build_processed_pair_tensors(cad_image, ori_image, rotation_transform)
+
+
+def build_processed_pair_tensors(cad_image, ori_image, rotation_transform=None):
     cad_image = TF.convert_image_dtype(cad_image, torch.float32)
     ori_image = TF.convert_image_dtype(ori_image, torch.float32)
 
@@ -146,13 +152,24 @@ def _resolve_rotation_angle(rotation_transform):
 
 
 class RecursiveImageDataset(Dataset):
-    def __init__(self, root_dir, samples=None, image_size=DEFAULT_IMAGE_SIZE):
+    def __init__(
+        self,
+        root_dir,
+        samples=None,
+        image_size=DEFAULT_IMAGE_SIZE,
+        rotation=None,
+        cache_mode="none",
+    ):
         self.root_dir = root_dir
         self.cad_root = os.path.join(root_dir, "cad")
         self.ori_root = os.path.join(root_dir, "ori")
         self.samples = list(samples) if samples is not None else collect_paired_samples(root_dir)
 
-        self.rotation = (-10.0, 10.0)
+        self.rotation = rotation
+        self.cache_mode = cache_mode
+        self.cache_dir = os.path.join(root_dir, CACHE_DIR_NAME, cache_mode)
+        if self.cache_mode != "none":
+            os.makedirs(self.cache_dir, exist_ok=True)
 
         if not self.samples:
             raise ValueError(f"No images were found in: {root_dir}")
@@ -162,7 +179,16 @@ class RecursiveImageDataset(Dataset):
 
     def __getitem__(self, index):
         cad_path, ori_path = self.samples[index]
-        cad_tensor, ori_tensor = build_processed_pair(cad_path, ori_path, self.rotation)
+        if self.cache_mode == "processed":
+            cad_tensor, ori_tensor, fused_tensor = self._load_or_build_processed_cache(
+                index, cad_path, ori_path
+            )
+            return fused_tensor, cad_tensor, ori_tensor
+
+        if self.cache_mode == "source":
+            cad_tensor, ori_tensor = self._load_or_build_source_cache(index, cad_path, ori_path)
+        else:
+            cad_tensor, ori_tensor = build_processed_pair(cad_path, ori_path, self.rotation)
         fused_tensor = self._concat_channels(cad_tensor, ori_tensor)
 
         return fused_tensor, cad_tensor, ori_tensor
@@ -170,10 +196,56 @@ class RecursiveImageDataset(Dataset):
     def _concat_channels(self, cad_tensor, ori_tensor):
         return torch.cat([cad_tensor, ori_tensor], dim=0)
 
+    def _load_or_build_processed_cache(self, index, cad_path, ori_path):
+        cache_path = self._cache_path(index, cad_path, ori_path, suffix="processed")
+        if os.path.isfile(cache_path):
+            cached = torch.load(cache_path, map_location="cpu")
+            return cached["cad"], cached["ori"], cached["fused"]
 
-def build_dataloader(dataset, batch_size, shuffle, pin_memory):
+        cad_tensor, ori_tensor = build_processed_pair(cad_path, ori_path, self.rotation)
+        fused_tensor = self._concat_channels(cad_tensor, ori_tensor)
+        torch.save({"cad": cad_tensor, "ori": ori_tensor, "fused": fused_tensor}, cache_path)
+        return cad_tensor, ori_tensor, fused_tensor
+
+    def _load_or_build_source_cache(self, index, cad_path, ori_path):
+        cache_path = self._cache_path(index, cad_path, ori_path, suffix="source")
+        if os.path.isfile(cache_path):
+            cached = torch.load(cache_path, map_location="cpu")
+            cad_image = cached["cad"]
+            ori_image = cached["ori"]
+        else:
+            cad_image = read_image(cad_path, mode=ImageReadMode.RGB)
+            ori_image = read_image(ori_path, mode=ImageReadMode.RGB)
+            torch.save({"cad": cad_image, "ori": ori_image}, cache_path)
+
+        return build_processed_pair_tensors(cad_image, ori_image, self.rotation)
+
+    def _cache_path(self, index, cad_path, ori_path, suffix):
+        cache_key = self._cache_key(cad_path, ori_path, suffix)
+        return os.path.join(self.cache_dir, f"{index:08d}_{cache_key}.pt")
+
+    def _cache_key(self, cad_path, ori_path, suffix):
+        cad_stat = os.stat(cad_path)
+        ori_stat = os.stat(ori_path)
+        payload = "|".join(
+            [
+                os.path.relpath(cad_path, self.root_dir),
+                str(cad_stat.st_mtime_ns),
+                str(cad_stat.st_size),
+                os.path.relpath(ori_path, self.root_dir),
+                str(ori_stat.st_mtime_ns),
+                str(ori_stat.st_size),
+                str(self.rotation),
+                suffix,
+            ]
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def build_dataloader(dataset, batch_size, shuffle, pin_memory, num_workers=None):
     cpu_count = os.cpu_count() or 1
-    num_workers = min(8, max(0, cpu_count - 1))
+    if num_workers is None:
+        num_workers = min(16, max(0, cpu_count - 1))
     loader_kwargs = dict(
         dataset=dataset,
         batch_size=batch_size,
