@@ -45,6 +45,14 @@ class TrainingSignals(QObject):
     failed = pyqtSignal(str)
 
 
+class TestSignals(QObject):
+    started = pyqtSignal(str)
+    progress = pyqtSignal(str)
+    test_result_batch = pyqtSignal(object)
+    finished = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+
 class ExportSignals(QObject):
     started = pyqtSignal(str)
     progress = pyqtSignal(str)
@@ -516,3 +524,145 @@ class ExportOnnxTask(QRunnable):
 
         self.signals.progress.emit(f"ONNX-transformed test outputs saved to: {output_dir}")
         return len(test_samples)
+
+
+class TestTask(QRunnable):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.signals = TestSignals()
+
+    def run(self):
+        if torch is None:
+            self.signals.failed.emit(
+                f"PyTorch is not available. Install dependencies first.\n{TORCH_IMPORT_ERROR or ''}".strip()
+            )
+            return
+
+        try:
+            self._run_test()
+        except Exception:
+            self.signals.failed.emit(traceback.format_exc())
+
+    def _run_test(self):
+        dataset_path = self.config["dataset_path"]
+        checkpoint_path = self.config["checkpoint_path"]
+        train_ratio = self.config["train_ratio"]
+        validation_ratio = self.config["validation_ratio"]
+        test_ratio = self.config["test_ratio"]
+        split_seed = self.config.get("split_seed", 42)
+        batch_size = self.config["batch_size"]
+
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+        self.signals.started.emit("Preparing standalone test run...")
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        all_samples = collect_paired_samples(dataset_path)
+        split_samples = split_paired_samples(
+            all_samples,
+            train_ratio,
+            validation_ratio,
+            test_ratio,
+            seed=split_seed,
+        )
+        test_samples = split_samples["test"]
+        if not test_samples:
+            raise ValueError("Test split is empty. Increase the test ratio before running standalone test.")
+
+        test_dataset = RecursiveImageDataset(
+            dataset_path,
+            samples=test_samples,
+            rotation=None,
+            cache_mode="processed",
+        )
+        cpu_count = os.cpu_count() or 1
+        eval_workers = min(8, max(0, max(1, cpu_count // 2)))
+        pin_memory = torch.cuda.is_available()
+        test_loader = build_dataloader(
+            test_dataset,
+            batch_size,
+            False,
+            pin_memory,
+            num_workers=eval_workers,
+        )
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = STNAligner().to(device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+        criterion = nn.SmoothL1Loss()
+
+        test_loss = 0.0
+        total = 0
+        with torch.no_grad():
+            for fused_images, cad_images, ori_images in test_loader:
+                fused_images = fused_images.to(device, non_blocking=pin_memory)
+                cad_images = cad_images.to(device, non_blocking=pin_memory)
+                ori_images = ori_images.to(device, non_blocking=pin_memory)
+                aligned_cad_images = model(fused_images, cad_images)
+                loss = criterion(aligned_cad_images, ori_images)
+                test_loss += loss.item() * fused_images.size(0)
+                total += fused_images.size(0)
+
+        final_test_loss = test_loss / max(1, total)
+        self.signals.progress.emit(f"Standalone test loss: {final_test_loss:.4f}")
+
+        output_dir = os.path.join(os.getcwd(), "outputs", "standalone_test_results")
+        self._write_test_results(model, test_loader, test_dataset, device, pin_memory, output_dir)
+
+        self.signals.finished.emit(
+            {
+                "checkpoint_path": checkpoint_path,
+                "test_loss": final_test_loss,
+                "result_dir": output_dir,
+            }
+        )
+
+    def _write_test_results(self, model, data_loader, dataset, device, pin_memory, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        sample_offset = 0
+        result_batch = []
+        self.signals.progress.emit("Writing standalone test outputs...")
+
+        with torch.no_grad():
+            for fused_images, cad_images, ori_images in data_loader:
+                batch_size = fused_images.size(0)
+                fused_images = fused_images.to(device, non_blocking=pin_memory)
+                cad_images = cad_images.to(device, non_blocking=pin_memory)
+                ori_images = ori_images.to(device, non_blocking=pin_memory)
+                aligned_cad_images = model(fused_images, cad_images).clamp(0.0, 1.0)
+                per_item_losses = F.smooth_l1_loss(
+                    aligned_cad_images,
+                    ori_images,
+                    reduction="none",
+                ).mean(dim=(1, 2, 3))
+
+                for item_index in range(batch_size):
+                    sample_index = sample_offset + item_index
+                    cad_path, ori_path = dataset.samples[sample_index]
+                    output_path = os.path.join(
+                        output_dir,
+                        f"standalone_test_{sample_index + 1:06d}_aligned_cad.png",
+                    )
+                    save_image(aligned_cad_images[item_index].cpu(), output_path)
+                    result_batch.append(
+                        {
+                            "index": sample_index + 1,
+                            "cad_path": cad_path,
+                            "ori_path": ori_path,
+                            "aligned_path": output_path,
+                            "loss": float(per_item_losses[item_index].detach().cpu().item()),
+                        }
+                    )
+
+                    if len(result_batch) >= 64:
+                        self.signals.test_result_batch.emit(result_batch)
+                        result_batch = []
+
+                sample_offset += batch_size
+
+        if result_batch:
+            self.signals.test_result_batch.emit(result_batch)
+        self.signals.progress.emit(f"Standalone test outputs saved to: {output_dir}")

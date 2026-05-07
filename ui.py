@@ -2,7 +2,7 @@ import os
 from collections import deque
 
 from data_pipeline import collect_paired_samples, split_paired_samples
-from training import ExportOnnxTask, TORCH_IMPORT_ERROR, TrainingTask, torch
+from training import ExportOnnxTask, TORCH_IMPORT_ERROR, TestTask, TrainingTask, torch
 
 from PyQt5.QtCore import QObject, QRunnable, Qt, QThreadPool, pyqtSignal
 from PyQt5.QtGui import QPixmap
@@ -330,6 +330,7 @@ class MainWindow(QMainWindow):
         self.test_result_pixmap_cache = {}
         self.onnx_result_pixmap_cache = {}
         self.is_training = False
+        self.is_testing = False
         self.is_exporting = False
         self.onnx_export_ready = False
         self.latest_checkpoint_path = None
@@ -423,16 +424,49 @@ class MainWindow(QMainWindow):
         dataset_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_layout.addWidget(dataset_group, stretch=1)
 
+        checkpoint_group = QGroupBox("Model Checkpoint")
+        checkpoint_layout = QVBoxLayout(checkpoint_group)
+        checkpoint_layout.setContentsMargins(10, 18, 10, 10)
+        checkpoint_layout.setSpacing(8)
+
+        checkpoint_row = QHBoxLayout()
+        checkpoint_row.setSpacing(10)
+        self.checkpoint_path_edit = QLineEdit()
+        self.checkpoint_path_edit.setPlaceholderText("Optional: choose a trained .pt checkpoint for standalone test")
+        checkpoint_browse_button = QPushButton("Browse")
+        checkpoint_browse_button.setObjectName("ghostButton")
+        checkpoint_browse_button.setMinimumWidth(96)
+        checkpoint_browse_button.setMaximumWidth(120)
+        checkpoint_browse_button.clicked.connect(self.select_checkpoint)
+        checkpoint_row.addWidget(self.checkpoint_path_edit)
+        checkpoint_row.addWidget(checkpoint_browse_button)
+        checkpoint_layout.addLayout(checkpoint_row)
+
+        self.checkpoint_hint_label = QLabel(
+            "If empty, DART will use the latest trained checkpoint when available."
+        )
+        self.checkpoint_hint_label.setWordWrap(True)
+        self.checkpoint_hint_label.setStyleSheet(
+            "color: #aea397; background: #121518; border: 1px solid #262b31; border-radius: 10px; padding: 8px 10px;"
+        )
+        checkpoint_layout.addWidget(self.checkpoint_hint_label)
+
+        left_layout.addWidget(checkpoint_group, stretch=0)
+
         button_row = QHBoxLayout()
         button_row.setSpacing(10)
         self.train_button = QPushButton("Train")
         self.train_button.setObjectName("primaryButton")
         self.train_button.clicked.connect(self.start_training)
+        self.test_button = QPushButton("Run Test")
+        self.test_button.setObjectName("ghostButton")
+        self.test_button.clicked.connect(self.start_test)
         self.onnx_button = QPushButton("Export ONNX")
         self.onnx_button.setObjectName("ghostButton")
         self.onnx_button.setEnabled(False)
         self.onnx_button.clicked.connect(self.export_onnx)
         button_row.addWidget(self.train_button)
+        button_row.addWidget(self.test_button)
         button_row.addWidget(self.onnx_button)
         left_layout.addLayout(button_row)
 
@@ -742,11 +776,24 @@ class MainWindow(QMainWindow):
         task.signals.failed.connect(self.on_training_failed)
         self.thread_pool.start(task)
 
+    def select_checkpoint(self):
+        checkpoint_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select trained checkpoint",
+            self.checkpoint_path_edit.text() or os.path.join(os.getcwd(), "outputs"),
+            "PyTorch Checkpoints (*.pt)",
+        )
+        if checkpoint_path:
+            self.checkpoint_path_edit.setText(checkpoint_path)
+            self.refresh_action_state()
+
     def on_training_finished(self, result):
         self.is_training = False
         self.onnx_export_ready = True
         self.latest_checkpoint_path = result["latest_model_path"]
         self.best_checkpoint_path = result["best_model_path"]
+        if not self.checkpoint_path_edit.text().strip():
+            self.checkpoint_path_edit.setText(self.best_checkpoint_path)
         self.append_log(f"Latest checkpoint saved: {result['latest_model_path']}")
         self.append_log(f"Best checkpoint saved: {result['best_model_path']}")
         self.append_log(f"Training config saved: {result['metadata_path']}")
@@ -762,8 +809,77 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Training failed", error_message)
         self.refresh_action_state()
 
+    def start_test(self):
+        if self.is_training or self.is_testing or self.is_exporting:
+            return
+
+        if torch is None:
+            QMessageBox.critical(
+                self,
+                "PyTorch unavailable",
+                f"PyTorch import failed.\n\n{TORCH_IMPORT_ERROR or 'Unknown error'}",
+            )
+            return
+
+        dataset_path = self.dataset_panel.path_edit.text().strip()
+        if not dataset_path or not os.path.isdir(dataset_path):
+            QMessageBox.warning(self, "Missing dataset path", "Select a valid dataset folder first.")
+            return
+
+        checkpoint_path = (
+            self.checkpoint_path_edit.text().strip()
+            or self.best_checkpoint_path
+            or self.latest_checkpoint_path
+        )
+        if not checkpoint_path or not os.path.isfile(checkpoint_path):
+            QMessageBox.warning(
+                self,
+                "Missing checkpoint",
+                "Choose a trained .pt checkpoint or run training first.",
+            )
+            return
+
+        config = {
+            "dataset_path": dataset_path,
+            "checkpoint_path": checkpoint_path,
+            "train_ratio": self.train_ratio_input.value(),
+            "validation_ratio": self.validation_ratio_input.value(),
+            "test_ratio": self.test_ratio_input.value(),
+            "split_seed": 42,
+            "batch_size": self.batch_input.value(),
+        }
+
+        self.is_testing = True
+        self.clear_test_results()
+        self.append_log("Starting standalone test...")
+        self.summary_label.setText("Standalone test in progress.")
+        self.refresh_action_state()
+
+        task = TestTask(config)
+        task.signals.started.connect(self.append_log)
+        task.signals.progress.connect(self.append_log)
+        task.signals.test_result_batch.connect(self.on_test_result_batch)
+        task.signals.finished.connect(self.on_test_finished)
+        task.signals.failed.connect(self.on_test_failed)
+        self.thread_pool.start(task)
+
+    def on_test_finished(self, result):
+        self.is_testing = False
+        self.append_log(f"Standalone test loss: {result['test_loss']:.4f}")
+        self.append_log(f"Standalone test outputs saved to: {result['result_dir']}")
+        self.summary_label.setText("Standalone test finished successfully.")
+        self.refresh_action_state()
+
+    def on_test_failed(self, error_message):
+        self.is_testing = False
+        self.append_log("Standalone test failed.")
+        self.append_log(error_message.strip())
+        self.summary_label.setText("Standalone test failed. Review the log output.")
+        QMessageBox.critical(self, "Standalone test failed", error_message)
+        self.refresh_action_state()
+
     def export_onnx(self):
-        if self.is_training or self.is_exporting:
+        if self.is_training or self.is_testing or self.is_exporting:
             return
 
         checkpoint_path = self.best_checkpoint_path or self.latest_checkpoint_path
@@ -959,41 +1075,64 @@ class MainWindow(QMainWindow):
             + self.validation_ratio_input.value()
             + self.test_ratio_input.value()
         ) > 0
-        busy = self.is_training or self.is_exporting
+        checkpoint_ready = bool(
+            (self.checkpoint_path_edit.text().strip() and os.path.isfile(self.checkpoint_path_edit.text().strip()))
+            or (self.best_checkpoint_path and os.path.isfile(self.best_checkpoint_path))
+            or (self.latest_checkpoint_path and os.path.isfile(self.latest_checkpoint_path))
+        )
+        busy = self.is_training or self.is_testing or self.is_exporting
         self.train_button.setEnabled(dataset_ready and ratios_ready and not busy)
+        self.test_button.setEnabled(dataset_ready and ratios_ready and checkpoint_ready and not busy)
         self.onnx_button.setEnabled(self.onnx_export_ready and not busy)
 
         if self.is_training:
             status_message = "Training in progress. Check the log for epoch updates."
             train_tooltip = "Training is currently running."
+            test_tooltip = "Wait for training to finish."
             onnx_tooltip = "ONNX export is available after training finishes."
+        elif self.is_testing:
+            status_message = "Standalone test in progress."
+            train_tooltip = "Wait for standalone test to finish."
+            test_tooltip = "Standalone test is currently running."
+            onnx_tooltip = "Wait for standalone test to finish."
         elif self.is_exporting:
             status_message = "ONNX export in progress."
             train_tooltip = "Wait for ONNX export to finish."
+            test_tooltip = "Wait for ONNX export to finish."
             onnx_tooltip = "ONNX export is currently running."
         elif not dataset_ready:
             status_message = (
                 "Train is disabled: select a valid dataset folder with cad and ori subfolders."
             )
             train_tooltip = "Set the dataset path to a valid folder first."
+            test_tooltip = "Set the dataset path to a valid folder first."
             onnx_tooltip = "Run training first to create a checkpoint for ONNX export."
         elif not ratios_ready:
             status_message = "Train is disabled: train ratio must be greater than 0."
             train_tooltip = "Set Train Ratio to a value greater than 0."
+            test_tooltip = "Set Train Ratio to a value greater than 0."
             onnx_tooltip = "Run training first to create a checkpoint for ONNX export."
+        elif not checkpoint_ready:
+            status_message = "Train is ready. Standalone test needs a trained checkpoint."
+            train_tooltip = "Start training with the current dataset paths and options."
+            test_tooltip = "Choose a trained .pt checkpoint or run training first."
+            onnx_tooltip = "Run training first to enable ONNX export."
         elif not self.onnx_export_ready:
             status_message = (
                 "Train is ready. Dataset will be split by the configured ratios before training."
             )
             train_tooltip = "Start training with the current dataset paths and options."
+            test_tooltip = "Run standalone test with the selected checkpoint."
             onnx_tooltip = "Run training first to enable ONNX export."
         else:
             status_message = "Train is ready, and ONNX export is available from the latest trained checkpoint."
             train_tooltip = "Start a new training run."
+            test_tooltip = "Run standalone test with the selected checkpoint."
             onnx_tooltip = "Export the best saved checkpoint to ONNX."
 
         self.summary_label.setText(status_message)
         self.train_button.setToolTip(train_tooltip)
+        self.test_button.setToolTip(test_tooltip)
         self.onnx_button.setToolTip(onnx_tooltip)
 
     def resizeEvent(self, event):
