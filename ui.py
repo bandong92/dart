@@ -496,14 +496,15 @@ class MainWindow(QMainWindow):
             "Select a valid dataset folder and split ratios to enable training."
         )
         self.summary_label.setWordWrap(True)
-        self.summary_label.setStyleSheet("color: #9f9589; padding: 4px 2px;")
+        self.summary_label.setStyleSheet("color: #9f9589; padding: 1px 2px; min-height: 18px;")
         left_layout.addWidget(self.summary_label, stretch=0)
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMinimumHeight(130)
+        self.log_view.setMinimumHeight(84)
+        self.log_view.setMaximumHeight(110)
         self.log_view.setStyleSheet(
-            "background: #121518; border: 1px solid #262b31; border-radius: 12px; color: #ded6cb; padding: 8px;"
+            "background: #121518; border: 1px solid #262b31; border-radius: 12px; color: #ded6cb; padding: 5px;"
         )
         left_layout.addWidget(self.log_view, stretch=0)
 
