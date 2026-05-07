@@ -269,7 +269,7 @@ class DatasetPanel(QGroupBox):
         path_row.setSpacing(10)
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText("Dataset folder containing cad and ori subfolders")
-        self.path_edit.setMinimumWidth(220)
+        self.path_edit.setMinimumWidth(320)
         self.path_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         browse_button = QPushButton("Browse")
         browse_button.setObjectName("ghostButton")
@@ -374,6 +374,8 @@ class MainWindow(QMainWindow):
         config_layout = QFormLayout(config_group)
         config_layout.setSpacing(10)
         config_layout.setLabelAlignment(Qt.AlignLeft)
+        config_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        config_layout.setFormAlignment(Qt.AlignTop)
 
         self.epoch_input = QSpinBox()
         self.epoch_input.setRange(1, 100000)
@@ -406,6 +408,17 @@ class MainWindow(QMainWindow):
         self.validation_ratio_input.valueChanged.connect(self.on_split_ratio_changed)
         self.test_ratio_input.valueChanged.connect(self.on_split_ratio_changed)
 
+        for widget in (
+            self.epoch_input,
+            self.batch_input,
+            self.lr_input,
+            self.train_ratio_input,
+            self.validation_ratio_input,
+            self.test_ratio_input,
+        ):
+            widget.setMinimumWidth(200)
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
         config_layout.addRow("Epoch", self.epoch_input)
         config_layout.addRow("Batch Size", self.batch_input)
         config_layout.addRow("Learning Rate", self.lr_input)
@@ -433,6 +446,8 @@ class MainWindow(QMainWindow):
         checkpoint_row.setSpacing(10)
         self.checkpoint_path_edit = QLineEdit()
         self.checkpoint_path_edit.setPlaceholderText("Optional: choose a trained .pt checkpoint for standalone test")
+        self.checkpoint_path_edit.setMinimumWidth(320)
+        self.checkpoint_path_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         checkpoint_browse_button = QPushButton("Browse")
         checkpoint_browse_button.setObjectName("ghostButton")
         checkpoint_browse_button.setMinimumWidth(96)
@@ -465,6 +480,9 @@ class MainWindow(QMainWindow):
         self.onnx_button.setObjectName("ghostButton")
         self.onnx_button.setEnabled(False)
         self.onnx_button.clicked.connect(self.export_onnx)
+        for button in (self.train_button, self.test_button, self.onnx_button):
+            button.setMinimumWidth(130)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         button_row.addWidget(self.train_button)
         button_row.addWidget(self.test_button)
         button_row.addWidget(self.onnx_button)
@@ -648,11 +666,11 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
-        left_widget.setMinimumWidth(460)
-        right_widget.setMinimumWidth(520)
-        splitter.setStretchFactor(0, 5)
-        splitter.setStretchFactor(1, 6)
-        splitter.setSizes([620, 740])
+        left_widget.setMinimumWidth(620)
+        right_widget.setMinimumWidth(440)
+        splitter.setStretchFactor(0, 7)
+        splitter.setStretchFactor(1, 5)
+        splitter.setSizes([820, 580])
         self.refresh_action_state()
 
     def select_folder(self, dataset_name):
