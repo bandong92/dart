@@ -42,7 +42,7 @@ QMainWindow, QWidget {
     font-size: 10.5pt;
 }
 QLabel#heroTitle {
-    font-size: 14pt;
+    font-size: 12pt;
     font-weight: 700;
     color: #f4efe7;
     letter-spacing: 0.3px;
@@ -102,7 +102,7 @@ QPushButton {
     background: #1a1d21;
     border: 1px solid #30353d;
     border-radius: 12px;
-    padding: 10px 16px;
+    padding: 6px 12px;
     color: #f2ede6;
     font-weight: 600;
 }
@@ -161,6 +161,11 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0;
 }
 """
+
+STATUS_BOX_STYLE = (
+    "color: #aea397; background: #121518; border: 1px solid #262b31; "
+    "border-radius: 10px; padding: 5px 8px; min-height: 20px;"
+)
 
 
 class DatasetScanSignals(QObject):
@@ -284,13 +289,11 @@ class DatasetPanel(QGroupBox):
         layout.addLayout(path_row)
 
         self.status_label = QLabel("No folder selected.")
-        self.status_label.setStyleSheet(
-            "color: #aea397; background: #121518; border: 1px solid #262b31; border-radius: 10px; padding: 8px 10px;"
-        )
+        self.status_label.setStyleSheet(STATUS_BOX_STYLE)
         layout.addWidget(self.status_label)
 
         self.sample_list = QListWidget()
-        self.sample_list.setMinimumHeight(90)
+        self.sample_list.setMinimumHeight(64)
         self.sample_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.sample_list)
 
@@ -354,7 +357,7 @@ class MainWindow(QMainWindow):
         hero_card = QFrame()
         hero_card.setObjectName("heroCard")
         hero_layout = QVBoxLayout(hero_card)
-        hero_layout.setContentsMargins(20, 12, 20, 12)
+        hero_layout.setContentsMargins(18, 8, 18, 8)
         hero_layout.setSpacing(0)
         hero_title = QLabel("DART")
         hero_title.setObjectName("heroTitle")
@@ -430,12 +433,12 @@ class MainWindow(QMainWindow):
 
         dataset_group = QGroupBox("Dataset Sources")
         dataset_layout = QVBoxLayout(dataset_group)
-        dataset_layout.setContentsMargins(10, 18, 10, 10)
+        dataset_layout.setContentsMargins(8, 14, 8, 8)
         self.dataset_panel = DatasetPanel("dataset")
         self.dataset_panel.path_requested.connect(self.select_folder)
         dataset_layout.addWidget(self.dataset_panel)
-        dataset_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        left_layout.addWidget(dataset_group, stretch=1)
+        dataset_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
+        left_layout.addWidget(dataset_group, stretch=0)
 
         checkpoint_group = QGroupBox("Model Checkpoint")
         checkpoint_layout = QVBoxLayout(checkpoint_group)
@@ -461,9 +464,7 @@ class MainWindow(QMainWindow):
             "If empty, DART will use the latest trained checkpoint when available."
         )
         self.checkpoint_hint_label.setWordWrap(True)
-        self.checkpoint_hint_label.setStyleSheet(
-            "color: #aea397; background: #121518; border: 1px solid #262b31; border-radius: 10px; padding: 8px 10px;"
-        )
+        self.checkpoint_hint_label.setStyleSheet(STATUS_BOX_STYLE)
         checkpoint_layout.addWidget(self.checkpoint_hint_label)
 
         left_layout.addWidget(checkpoint_group, stretch=0)
@@ -481,8 +482,11 @@ class MainWindow(QMainWindow):
         self.onnx_button.setEnabled(False)
         self.onnx_button.clicked.connect(self.export_onnx)
         for button in (self.train_button, self.test_button, self.onnx_button):
-            button.setMinimumWidth(130)
-            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setMinimumWidth(96)
+            button.setMaximumWidth(120)
+            button.setMinimumHeight(32)
+            button.setMaximumHeight(34)
+            button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         button_row.addWidget(self.train_button)
         button_row.addWidget(self.test_button)
         button_row.addWidget(self.onnx_button)
@@ -534,9 +538,7 @@ class MainWindow(QMainWindow):
             "Select a dataset folder to populate the validation split browser."
         )
         self.validation_status_label.setWordWrap(True)
-        self.validation_status_label.setStyleSheet(
-            "color: #aea397; background: #121518; border: 1px solid #262b31; border-radius: 10px; padding: 8px 10px;"
-        )
+        self.validation_status_label.setStyleSheet(STATUS_BOX_STYLE)
         validation_layout.addWidget(self.validation_status_label)
 
         self.validation_browser_list = QListWidget()
@@ -583,9 +585,7 @@ class MainWindow(QMainWindow):
             "No test result yet. Start training with a non-zero test ratio."
         )
         self.test_result_status_label.setWordWrap(True)
-        self.test_result_status_label.setStyleSheet(
-            "color: #aea397; background: #121518; border: 1px solid #262b31; border-radius: 10px; padding: 8px 10px;"
-        )
+        self.test_result_status_label.setStyleSheet(STATUS_BOX_STYLE)
         test_layout.addWidget(self.test_result_status_label)
 
         self.test_result_list = QListWidget()
@@ -632,9 +632,7 @@ class MainWindow(QMainWindow):
             "No ONNX result yet. Export ONNX after training to populate this view."
         )
         self.onnx_result_status_label.setWordWrap(True)
-        self.onnx_result_status_label.setStyleSheet(
-            "color: #aea397; background: #121518; border: 1px solid #262b31; border-radius: 10px; padding: 8px 10px;"
-        )
+        self.onnx_result_status_label.setStyleSheet(STATUS_BOX_STYLE)
         onnx_layout.addWidget(self.onnx_result_status_label)
 
         self.onnx_result_list = QListWidget()
