@@ -33,7 +33,42 @@ except Exception as exc:
     ort = None
     ONNXRUNTIME_IMPORT_ERROR = str(exc)
 
-from PyQt5.QtCore import QObject, QRunnable, pyqtSignal
+try:
+    from PyQt5.QtCore import QObject, QRunnable, pyqtSignal
+except Exception:
+    class QObject:
+        pass
+
+    class QRunnable:
+        def run(self):
+            raise NotImplementedError
+
+    class _FallbackBoundSignal:
+        def __init__(self):
+            self._callbacks = []
+
+        def connect(self, callback):
+            self._callbacks.append(callback)
+
+        def emit(self, *args, **kwargs):
+            for callback in list(self._callbacks):
+                callback(*args, **kwargs)
+
+    class _FallbackSignalDescriptor:
+        def __set_name__(self, owner, name):
+            self._name = name
+
+        def __get__(self, instance, owner):
+            if instance is None:
+                return self
+            signal = instance.__dict__.get(self._name)
+            if signal is None:
+                signal = _FallbackBoundSignal()
+                instance.__dict__[self._name] = signal
+            return signal
+
+    def pyqtSignal(*_args, **_kwargs):
+        return _FallbackSignalDescriptor()
 
 
 class TrainingSignals(QObject):
@@ -129,6 +164,7 @@ class TrainingTask(QRunnable):
         epochs = self.config["epochs"]
         batch_size = self.config["batch_size"]
         learning_rate = self.config["learning_rate"]
+        resume_from = self.config.get("resume_from")
 
         self.signals.started.emit("Preparing datasets...")
 
@@ -204,9 +240,35 @@ class TrainingTask(QRunnable):
         best_model_path = os.path.join(output_dir, "dart_stn_best.pt")
         metadata_path = os.path.join(output_dir, "dart_training_config.json")
 
+        best_validation_loss = float("inf")
+        history = []
+        start_epoch = 1
+
+        if resume_from:
+            if not os.path.isfile(resume_from):
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
+
+            resume_checkpoint = torch.load(resume_from, map_location=device)
+            model.load_state_dict(resume_checkpoint["model_state_dict"])
+            optimizer_state_dict = resume_checkpoint.get("optimizer_state_dict")
+            if optimizer_state_dict is not None:
+                optimizer.load_state_dict(optimizer_state_dict)
+
+            start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1
+            best_validation_loss = float(
+                resume_checkpoint.get("best_validation_loss", best_validation_loss)
+            )
+            history = list(resume_checkpoint.get("history", []))
+            self.signals.progress.emit(
+                f"Resuming training from epoch {start_epoch} using checkpoint: {resume_from}"
+            )
+
+        target_epoch = start_epoch + max(0, epochs) - 1
+
         with open(metadata_path, "w", encoding="utf-8") as metadata_file:
             json.dump(
                 {
+                    "mode": "train",
                     "dataset_path": dataset_path,
                     "train_ratio": train_ratio,
                     "validation_ratio": validation_ratio,
@@ -222,20 +284,21 @@ class TrainingTask(QRunnable):
                     "learning_rate": learning_rate,
                     "objective": "self_supervised_cad_to_ori_alignment",
                     "loss": "SmoothL1Loss",
+                    "resume_from": resume_from,
+                    "start_epoch": start_epoch,
+                    "target_epoch": target_epoch,
                 },
                 metadata_file,
                 indent=2,
             )
-
-        best_validation_loss = float("inf")
-        history = []
         self.signals.progress.emit(
             f"Self-supervised training started on {device.type.upper()} with {len(train_dataset):,} training pairs. "
             f"train workers={train_workers}, eval workers={eval_workers}, "
-            f"train cache=source, eval cache=processed."
+            f"train cache=source, eval cache=processed. "
+            f"epoch range={start_epoch}-{target_epoch}."
         )
 
-        for epoch in range(1, epochs + 1):
+        for epoch in range(start_epoch, target_epoch + 1):
             model.train()
             running_loss = 0.0
             total = 0
@@ -281,6 +344,11 @@ class TrainingTask(QRunnable):
                 "validation_loss": validation_loss,
                 "image_height": ORI_HEIGHT,
                 "image_width": ORI_WIDTH,
+                "best_validation_loss": best_validation_loss,
+                "history": history,
+                "batch_size": batch_size,
+                "learning_rate": learning_rate,
+                "resume_from": resume_from,
             }
             torch.save(checkpoint, latest_model_path)
 
@@ -301,8 +369,11 @@ class TrainingTask(QRunnable):
                     "validation_loss": validation_loss,
                 }
             )
+            checkpoint["history"] = history
+            checkpoint["best_validation_loss"] = best_validation_loss
+            torch.save(checkpoint, latest_model_path)
 
-            message = f"Epoch {epoch}/{epochs} | train loss {train_loss:.4f}"
+            message = f"Epoch {epoch}/{target_epoch} | train loss {train_loss:.4f}"
             if validation_loss is not None:
                 message += f" | val loss {validation_loss:.4f}"
             if improved:
@@ -666,3 +737,59 @@ class TestTask(QRunnable):
         if result_batch:
             self.signals.test_result_batch.emit(result_batch)
         self.signals.progress.emit(f"Standalone test outputs saved to: {output_dir}")
+
+
+def _attach_callback(signal, callback):
+    if callback is not None:
+        signal.connect(callback)
+
+
+def run_training_job(config, progress_callback=None, test_result_callback=None):
+    task = TrainingTask(config)
+    result = {}
+    errors = []
+
+    _attach_callback(task.signals.started, progress_callback)
+    _attach_callback(task.signals.progress, progress_callback)
+    _attach_callback(task.signals.test_result_batch, test_result_callback)
+    task.signals.finished.connect(lambda payload: result.update(payload))
+    task.signals.failed.connect(lambda message: errors.append(message))
+    task.run()
+
+    if errors:
+        raise RuntimeError(errors[0])
+    return result
+
+
+def run_test_job(config, progress_callback=None, test_result_callback=None):
+    task = TestTask(config)
+    result = {}
+    errors = []
+
+    _attach_callback(task.signals.started, progress_callback)
+    _attach_callback(task.signals.progress, progress_callback)
+    _attach_callback(task.signals.test_result_batch, test_result_callback)
+    task.signals.finished.connect(lambda payload: result.update(payload))
+    task.signals.failed.connect(lambda message: errors.append(message))
+    task.run()
+
+    if errors:
+        raise RuntimeError(errors[0])
+    return result
+
+
+def run_export_onnx_job(checkpoint_path, output_path, progress_callback=None, onnx_result_callback=None):
+    task = ExportOnnxTask(checkpoint_path, output_path)
+    result = {}
+    errors = []
+
+    _attach_callback(task.signals.started, progress_callback)
+    _attach_callback(task.signals.progress, progress_callback)
+    _attach_callback(task.signals.onnx_result_batch, onnx_result_callback)
+    task.signals.finished.connect(lambda payload: result.update(payload))
+    task.signals.failed.connect(lambda message: errors.append(message))
+    task.run()
+
+    if errors:
+        raise RuntimeError(errors[0])
+    return result

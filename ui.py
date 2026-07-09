@@ -9,7 +9,7 @@ from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -374,11 +374,9 @@ class MainWindow(QMainWindow):
         left_layout.setSpacing(12)
 
         config_group = QGroupBox("Training Configuration")
-        config_layout = QFormLayout(config_group)
-        config_layout.setSpacing(10)
-        config_layout.setLabelAlignment(Qt.AlignLeft)
-        config_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        config_layout.setFormAlignment(Qt.AlignTop)
+        config_layout = QGridLayout(config_group)
+        config_layout.setHorizontalSpacing(12)
+        config_layout.setVerticalSpacing(8)
 
         self.epoch_input = QSpinBox()
         self.epoch_input.setRange(1, 100000)
@@ -422,12 +420,20 @@ class MainWindow(QMainWindow):
             widget.setMinimumWidth(200)
             widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        config_layout.addRow("Epoch", self.epoch_input)
-        config_layout.addRow("Batch Size", self.batch_input)
-        config_layout.addRow("Learning Rate", self.lr_input)
-        config_layout.addRow("Train Ratio", self.train_ratio_input)
-        config_layout.addRow("Validation Ratio", self.validation_ratio_input)
-        config_layout.addRow("Test Ratio", self.test_ratio_input)
+        config_layout.addWidget(QLabel("Epoch"), 0, 0)
+        config_layout.addWidget(self.epoch_input, 0, 1)
+        config_layout.addWidget(QLabel("Batch Size"), 0, 2)
+        config_layout.addWidget(self.batch_input, 0, 3)
+        config_layout.addWidget(QLabel("Learning Rate"), 0, 4)
+        config_layout.addWidget(self.lr_input, 0, 5)
+        config_layout.addWidget(QLabel("Train Ratio"), 1, 0)
+        config_layout.addWidget(self.train_ratio_input, 1, 1)
+        config_layout.addWidget(QLabel("Validation Ratio"), 1, 2)
+        config_layout.addWidget(self.validation_ratio_input, 1, 3)
+        config_layout.addWidget(QLabel("Test Ratio"), 1, 4)
+        config_layout.addWidget(self.test_ratio_input, 1, 5)
+        for column in (1, 3, 5):
+            config_layout.setColumnStretch(column, 1)
         config_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         left_layout.addWidget(config_group, stretch=0)
 
